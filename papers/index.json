@@ -1,0 +1,432 @@
+[
+  {
+    "title": "The Byzantine Generals Problem",
+    "matched_title": "The Byzantine Generals Problem",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/357172.357176",
+    "pdf_url": "",
+    "landing_page": "https://dl.acm.org/doi/pdf/10.1145/357172.357176",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services",
+    "matched_title": "Brewer's conjecture and the feasibility of consistent, available, partition-tolerant web services",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/564585.564601",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1145/564585.564601",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "CAP Twelve Years Later: How the \"Rules\" Have Changed",
+    "matched_title": "CAP twelve years later: How the \"rules\" have changed",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1109/mc.2012.37",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1109/mc.2012.37",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "BASE: An Acid Alternative",
+    "matched_title": "BASE: An Acid Alternative",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/1394127.1394128",
+    "pdf_url": "",
+    "landing_page": "https://dl.acm.org/doi/pdf/10.1145/1394127.1394128",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "A Simple Totally Ordered Broadcast Protocol",
+    "matched_title": "A simple totally ordered broadcast protocol",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/1529974.1529978",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1145/1529974.1529978",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Virtual Time and Global States of Distributed Systems",
+    "matched_title": "Virtual Time and Global States of Distributed Systems",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.2.2620",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "A Brief History of Consensus, 2PC and Transaction Commit",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Paxos Made Simple",
+    "matched_title": "Paxos Made Simple",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "https://courses.cs.washington.edu/courses/cse490h/11wi/CSE490H_files/CSE550.paxos-simple.pdf",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Paxos Made Practical",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Paxos Made Live: An Engineering Perspective",
+    "matched_title": "Paxos Made Live - An Engineering Perspective (2006 Invited Talk)",
+    "score": "0.924",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "https://ai.google/research/pubs/pub33002",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Raft: In Search of an Understandable Consensus Algorithm",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "ZooKeeper: Wait-Free Coordination for Internet-Scale Systems",
+    "matched_title": "ZooKeeper: wait-free coordination for internet-scale systems",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.178.5750",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Using Paxos to Build a Scalable, Consistent, and Highly Available Datastore",
+    "matched_title": "Using Paxos to build a scalable, consistent, and highly available datastore",
+    "score": "1.000",
+    "doi": "https://doi.org/10.14778/1938545.1938549",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.14778/1938545.1938549",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Impossibility of Distributed Consensus With One Faulty Process",
+    "matched_title": "Impossibility of distributed consensus with one faulty process",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/3149.214121",
+    "pdf_url": "",
+    "landing_page": "https://dl.acm.org/doi/pdf/10.1145/3149.214121",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Consensus in the Presence of Partial Synchrony",
+    "matched_title": "Consensus in the presence of partial synchrony",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/42282.42283",
+    "pdf_url": "",
+    "landing_page": "https://dl.acm.org/doi/pdf/10.1145/42282.42283",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Chord: A Scalable Peer-to-Peer Lookup Service for Internet Applications",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "error: RemoteDisconnected",
+    "file": ""
+  },
+  {
+    "title": "Pastry: Scalable, Distributed Object Location, and Routing for Large-Scale Peer-to-Peer Systems",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Kademlia: A Peer-to-Peer Information System Based on the XOR Metric",
+    "matched_title": "Kademlia: A Peer-to-Peer Information System Based on the XOR Metric",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1007/3-540-45748-8_5",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1007/3-540-45748-8_5",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "A Scalable Content-Addressable Network",
+    "matched_title": "A scalable content-addressable network",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/383059.383072",
+    "pdf_url": "",
+    "landing_page": "https://dl.acm.org/doi/pdf/10.1145/383059.383072",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Ceph: A Scalable, High-Performance Distributed File System",
+    "matched_title": "Ceph: a scalable, high-performance distributed file system",
+    "score": "1.000",
+    "doi": "https://doi.org/10.5555/1298455.1298485",
+    "pdf_url": "",
+    "landing_page": "https://escholarship.org/uc/item/1pf8q17j",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "The Log-Structured-Merge-Tree",
+    "matched_title": "The log-structured merge-tree (LSM-tree)",
+    "score": "0.966",
+    "doi": "https://doi.org/10.1007/s002360050048",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1007/s002360050048",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "HBase: A NoSQL Database",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Tango: Distributed Data Structure over a Shared Log",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "The Google File System",
+    "matched_title": "The Google file system",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/1165389.945450",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1145/1165389.945450",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Bigtable: A Distributed Storage System for Structured Data",
+    "matched_title": "Bigtable: a distributed storage system for structured data",
+    "score": "1.000",
+    "doi": "https://doi.org/10.5555/1298455.1298475",
+    "pdf_url": "",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.101.9822",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "The Chubby Lock Service for Loosely-Coupled Distributed Systems",
+    "matched_title": "The Chubby lock service for loosely-coupled distributed systems",
+    "score": "1.000",
+    "doi": "https://doi.org/10.5555/1298455.1298487",
+    "pdf_url": "https://courses.cs.vt.edu/~cs5204/fall11-kafura/Papers/FaultTolerance/Chubby-Lock-Service.pdf",
+    "landing_page": "http://courses.cs.vt.edu/~cs5204/fall11-kafura/Papers/FaultTolerance/Chubby-Lock-Service.pdf",
+    "status": "downloaded",
+    "file": "C:\\Users\\92819\\Desktop\\自学分布式系统和相关算法\\papers\\The Chubby Lock Service for Loosely-Coupled Distributed Systems.pdf"
+  },
+  {
+    "title": "Finding a Needle in Haystack: Facebook's Photo Storage",
+    "matched_title": "Finding a needle in Haystack: facebook's photo storage",
+    "score": "1.000",
+    "doi": "https://doi.org/10.5555/1924943.1924947",
+    "pdf_url": "http://notes.stephenholiday.com/Haystack.pdf",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.225.5171",
+    "status": "downloaded",
+    "file": "C:\\Users\\92819\\Desktop\\自学分布式系统和相关算法\\papers\\Finding a Needle in Haystack_ Facebook's Photo Storage.pdf"
+  },
+  {
+    "title": "Windows Azure Storage: A Highly Available Cloud Storage Service with Strong Consistency",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing",
+    "matched_title": "Resilient distributed datasets: a fault-tolerant abstraction for in-memory cluster computing",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.225.856",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Scaling Distributed Machine Learning with the Parameter Server",
+    "matched_title": "Scaling distributed machine learning with the parameter server",
+    "score": "1.000",
+    "doi": "https://doi.org/10.5555/2685048.2685095",
+    "pdf_url": "https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-li_mu.pdf",
+    "landing_page": "https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-li_mu.pdf",
+    "status": "downloaded",
+    "file": "C:\\Users\\92819\\Desktop\\自学分布式系统和相关算法\\papers\\Scaling Distributed Machine Learning with the Parameter Server.pdf"
+  },
+  {
+    "title": "Dremel: Interactive Analysis of Web-Scale Datasets",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Pregel: A System for Large-Scale Graph Processing",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Spanner: Google's Globally-Distributed Database",
+    "matched_title": "Spanner: Google's globally-distributed database",
+    "score": "1.000",
+    "doi": "https://doi.org/10.5555/2387880.2387905",
+    "pdf_url": "https://courses.cs.vt.edu/cs5204/fall14-butt/lectures/spanner.pdf",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.258.9924",
+    "status": "downloaded",
+    "file": "C:\\Users\\92819\\Desktop\\自学分布式系统和相关算法\\papers\\Spanner_ Google's Globally-Distributed Database.pdf"
+  },
+  {
+    "title": "Dynamo: Amazon's Highly Available Key-value Store",
+    "matched_title": "Dynamo: Amazon's Highly Available Key-Value Store",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "https://www.academia.edu/49257135/Dynamo_Amazons_Highly_Available_Key_Value_Store",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "S4: Distributed Stream Computing Platform",
+    "matched_title": "S4: Distributed Stream Computing Platform",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1109/icdmw.2010.172",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1109/icdmw.2010.172",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Storm @Twitter",
+    "matched_title": "Storm@twitter",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/2588555.2595641",
+    "pdf_url": "",
+    "landing_page": "https://doi.org/10.1145/2588555.2595641",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Large-Scale Cluster Management at Google with Borg",
+    "matched_title": "Large-scale cluster management at Google with Borg",
+    "score": "1.000",
+    "doi": "https://doi.org/10.1145/2741948.2741964",
+    "pdf_url": "",
+    "landing_page": "https://dl.acm.org/doi/pdf/10.1145/2741948.2741964?download=true",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "F1: The Fault-Tolerant Distributed RDBMS Supporting Google's Ad Business",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Cassandra: A Decentralized Structured Storage System",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Megastore: Providing Scalable, Highly Available Storage for Interactive Services",
+    "matched_title": "Megastore: Providing Scalable, Highly Available Storage for Interactive Services",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.185.4719",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure",
+    "matched_title": "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure",
+    "score": "1.000",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.186.4021",
+    "status": "matched_no_pdf",
+    "file": ""
+  },
+  {
+    "title": "Kafka: A Distributed Messaging System for Log Processing",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  },
+  {
+    "title": "Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases",
+    "matched_title": "",
+    "score": "",
+    "doi": "",
+    "pdf_url": "",
+    "landing_page": "",
+    "status": "not_found",
+    "file": ""
+  }
+]

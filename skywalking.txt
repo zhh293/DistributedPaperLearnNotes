@@ -1,0 +1,556 @@
+分布式系统之链路追踪
+
+
+
+1.1 单体时代 vs 分布式时代的痛点
+
+单体时代：一个请求从进来到出去，都在同一个应用里，出问题直接看日志就能定位。
+分布式时代：一个请求会经过网关→服务 A→服务 B→数据库→消息队列→服务 C，横跨十几个节点，出问题你根本不知道是哪一步慢了、哪一步报错了。
+
+
+1.2 链路追踪的本质：给每个请求发一张 "快递物流单"
+把一个用户请求比作一个快递包裹：
+TraceID = 快递单号：全程唯一，从包裹发出到签收，单号不变。
+Span = 物流节点记录：包裹经过的每个站点（比如 "北京分拣中心→上海转运站→杭州派送点"），每个节点记录：
+什么时候到的
+什么时候走的
+处理了多久
+有没有出问题
+链路 = 完整物流轨迹：把所有 Span 按时间顺序串起来，就是这个请求的完整执行路径。
+
+
+
+1.3 链路追踪能做什么？
+定位慢请求：一眼看出哪个服务、哪个方法、哪个 SQL 拖慢了整个请求
+排查异常：直接找到哪个节点抛出了异常，看完整堆栈信息
+统计性能：自动统计每个接口的平均耗时、P99 耗时、错误率
+梳理依赖：自动生成服务拓扑图，看清整个系统的调用关系
+
+
+
+
+SkyWalking 是目前最主流的开源链路追踪工具，采用无侵入式字节码增强技术，不用改一行代码就能接入。
+它的架构分为三层，像一个完整的快递物流系统：
+
+
+
+【用户/应用】→ 【探针层（快递员）】→ 【后端层（物流中心）】→ 【UI层（快递查询网站）】
+
+
+
+第一层：探针层（Agent）—— 无处不在的快递员
+位置：部署在每一个应用服务的 JVM 进程里
+核心能力：无侵入式采集数据
+不用改业务代码，只需要在启动命令里加一行-javaagent:skywalking-agent.jar
+原理：字节码增强—— 在应用启动时，动态修改类的字节码，在方法入口和出口插入采集代码
+采集什么：
+所有 HTTP 请求、RPC 调用（Dubbo/Feign）
+数据库 SQL 执行、Redis 操作
+消息队列生产消费
+异常堆栈、日志
+方法执行耗时
+数据传输：把采集到的 Span 数据，通过 gRPC 协议批量发送给后端 OAP 服务器
+
+
+
+ 第二层：后端层（OAP Server）—— 物流中心
+这是 SkyWalking 的大脑，负责接收、处理、存储所有链路数据。
+核心组件：
+Receiver：接收探针发来的数据
+Analyzer：分析数据，把零散的 Span 组装成完整的 Trace
+Storage：存储数据，支持 Elasticsearch、MySQL、TiDB 等（生产环境必用 ES）
+Query：提供查询接口，给 UI 层提供数据
+数据流向：
+探针发送 Span → Receiver 接收 → Analyzer 组装成 Trace → Storage 存储 → Query 提供查询
+
+
+
+第三层：UI 层（SkyWalking UI）—— 快递查询网站
+可视化展示所有链路数据
+提供服务仪表盘、拓扑图、链路追踪、日志查询、性能剖析等功能
+支持按时间、服务、接口、TraceID 等维度筛选数据
+
+
+
+
+Skywalking的核心概念
+
+ Trace（追踪）—— 完整的快递物流单
+定义：一个完整的用户请求，从进入系统到离开系统的整个过程
+唯一标识：TraceID（16 位或 32 位字符串）
+特点：
+全程唯一，跨服务、跨线程、跨进程不变
+一个 Trace 包含多个 Span
+
+
+
+Span（跨度）—— 单个物流节点记录
+定义：Trace 中的一个最小执行单元，代表一次方法调用、一次 RPC 请求、一次 SQL 执行
+唯一标识：SpanID（每个 Trace 内唯一）
+核心属性：
+
+
+
+属性	                     含义	                      例子
+operationName	    操作名称	/api/order/create、SELECT * FROM order
+startTime          	开始时间	1714200000000（时间戳）
+endTime	            结束时间	1714200000100
+duration	             耗时	            100ms
+parentSpanID	    父 SpanID	    0（根 Span 没有父节点）
+tags	                  标签（键值对）	http.method=GET、db.type=mysql
+logs	                    日志	                   异常堆栈信息
+
+
+Span 的父子关系：
+根 Span：请求进入系统的第一个 Span（比如网关接收请求）
+子 Span：根 Span 调用的下一个方法 / 服务
+比如：网关 Span → 服务 A 的接口 Span → 服务 A 的 DAO 层 Span → 数据库 SQL Span
+
+
+
+
+Segment（段）—— 同一个服务内的一组 Span
+定义：同一个 JVM 进程内，同一个线程生成的所有 Span 的集合
+为什么需要 Segment？
+因为一个 Trace 可能横跨多个服务，每个服务生成自己的 Segment
+后端 OAP 会把多个 Segment 按 TraceID 组装成完整的 Trace
+
+
+
+
+
+
+TraceID: abc123
+├─ Span1（网关）：/api/order/create，耗时5ms，parentSpanID=0
+│  ├─ Span2（订单服务）：OrderController.create()，耗时80ms，parentSpanID=1
+│  │  ├─ Span3（订单服务）：OrderService.createOrder()，耗时70ms，parentSpanID=2
+│  │  │  ├─ Span4（数据库）：INSERT INTO order...，耗时20ms，parentSpanID=3
+│  │  │  ├─ Span5（库存服务RPC）：InventoryService.deduct()，耗时40ms，parentSpanID=3
+│  │  │  │  ├─ Span6（库存服务数据库）：UPDATE inventory...，耗时15ms，parentSpanID=5
+│  │  │  ├─ Span7（消息队列）：send order_created event，耗时5ms，parentSpanID=3
+
+
+
+
+
+
+完整调用链
+
+用户浏览器 → Nginx网关 → 订单服务（order-service） → 库存服务（inventory-service）
+                                 ↓                          ↓
+                          MySQL订单库                  MySQL库存库
+                                 ↓
+                          RocketMQ消息队列
+
+所有组件接入SkyWalking探针
+
+
+所有服务都是 Spring Boot 2.7.x
+网关用 Nginx 1.24
+RPC 调用用 OpenFeign
+ORM 用 MyBatis
+消息队列用 RocketMQ
+
+
+
+用户在浏览器点击之后发送post请求
+
+POST http://api.xxx.com/api/order/create
+Content-Type: application/json
+
+{"userId": 123, "productId": 456, "count": 2}
+
+
+
+SkyWalking 底层：TraceID 在这里诞生
+
+Nginx 已经部署了 SkyWalking Nginx 探针（libnginx_skywalking_module.so），当请求到达 Nginx 的 80 端口时：
+探针拦截请求：字节码增强（Nginx 是 C 语言，用模块注入）拦截了 Nginx 的ngx_http_process_request函数
+
+
+生成根 TraceID：调用 SkyWalking 的 ID 生成器，生成全局唯一的 TraceID
+格式：${时间戳(毫秒)}.${服务实例ID}.${自增序号}
+本次生成：1714200000000.12345.67890
+
+生成根 Span：创建第一个 Span（根 Span）
+SpanID：0（根 Span 的 SpanID 永远是 0）
+SegmentID：1714200000000.12345.67890（和 TraceID 相同，因为是第一个 Segment）
+operationName：POST:/api/order/create
+startTime：1714200000000（当前时间戳）
+tags：http.method=POST、http.url=http://api.xxx.com/api/order/create、http.status=200
+
+
+上下文存入 ThreadLocal：把TraceID=1714200000000.12345.67890、SpanID=0、SegmentID=1714200000000.12345.67890存入 Nginx 的线程局部变量（类似 Java 的 ThreadLocal）
+
+
+生成 sw8 请求头：把上下文编码成 SkyWalking 标准的sw8头，加到转发给下游的请求里
+sw8 头格式：${版本号}-${TraceID(base64)}-${父SpanID(base64)}-${父SegmentID(base64)}-${父服务名(base64)}-${父服务实例名(base64)}-${父端点名(base64)}-${采样标记}
+
+
+本次生成的 sw8 头：
+
+1-MTcxNDIwMDAwMDAwMC4xMjM0NS42Nzg5MA==-MA==-MTcxNDIwMDAwMDAwMC4xMjM0NS42Nzg5MA==-bmdpbng=-bmdpbngtaW5zdGFuY2Ux-L1BPU1Q6L2FwaS9vcmRlci9jcmVhdGU=-1
+
+
+
+为什么 TraceID 要这么生成？：时间戳保证有序，服务实例 ID 保证分布式唯一，自增序号保证同一毫秒内不重复
+
+为什么用 sw8 头而不是直接传 traceid？：sw8 头包含了完整的上下文（父 SpanID、父 SegmentID、父服务名），后端才能正确组装父子 Span 关系
+
+
+这里最容易出的问题：Nginx 没有加载 SkyWalking 模块，或者没有配置proxy_set_header sw8 $http_sw8;，导致 sw8 头没有转发到下游，TraceID 在这里消失
+
+
+
+
+Nginx 转发请求 → 进入订单服务（上下文传递）
+
+
+
+2.1 业务层面
+Nginx 把请求转发给订单服务的 8080 端口：
+
+
+POST http://order-service:8080/api/order/create
+Content-Type: application/json
+sw8: 1-MTcxNDIwMDAwMDAwMC4xMjM0NS42Nzg5MA==-MA==-MTcxNDIwMDAwMDAwMC4xMjM0NS42Nzg5MA==-bmdpbng=-bmdpbngtaW5zdGFuY2Ux-L1BPU1Q6L2FwaS9vcmRlci9jcmVhdGU=-1
+
+{"userId": 123, "productId": 456, "count": 2}
+
+
+
+
+2.2 SkyWalking 底层：解析 sw8 头，生成子 Span
+订单服务的 JVM 启动时加了-javaagent:skywalking-agent.jar，探针已经预增强了 Spring MVC 的DispatcherServlet类：
+
+拦截 Spring MVC 请求：探针拦截了DispatcherServlet.doDispatch()方法的入口
+
+
+解析 sw8 头：从 HTTP 请求头中取出sw8，解码得到父上下文：
+父 TraceID：1714200000000.12345.67890（和根 TraceID 相同，全程不变）
+父 SpanID：0（Nginx 的根 SpanID）
+父 SegmentID：1714200000000.12345.67890
+父服务名：nginx
+
+
+生成订单服务的Segment
+
+每个服务生成自己的 Segment
+SegmentID：1714200000010.67890.12345（订单服务自己生成的唯一 ID）
+
+
+
+生成订单服务的根 Span：
+SpanID：0（注意：每个 Segment 内的 SpanID 从 0 开始，全局不唯一，TraceID+SpanID 才唯一）
+parentSpanID：0（父 SpanID 是 Nginx 的 SpanID）
+operationName：POST:/api/order/create
+startTime：1714200000010（比 Nginx 晚 10ms，网络传输耗时）
+
+
+上下文存入 ThreadLocal：把当前 TraceID、SpanID、SegmentID 存入订单服务的ThreadLocal<Context>中
+SkyWalking 的上下文存储类：org.apache.skywalking.apm.agent.core.context.TraceContext
+这是所有上下文传递的核心：同一个线程内的所有方法，都能从这个 ThreadLocal 里拿到 TraceID
+
+
+
+
+为什么每个服务要生成自己的 Segment？：因为分布式系统中，每个服务是独立的进程，探针只能在自己的进程内采集数据，后端会把多个 Segment 按 TraceID 组装成完整的 Trace
+这里最容易出的问题：
+订单服务的探针没有加载：启动日志里没有SkyWalking Agent started字样
+sw8 头被过滤：Spring Cloud Gateway 或 Nginx 没有转发 sw8 头，导致订单服务解析不到父上下文，会重新生成一个新的 TraceID，链路在这里断裂
+跨线程上下文丢失：如果订单服务在这里用了new Thread()，新线程的 ThreadLocal 是空的，拿不到 TraceID
+
+
+
+
+
+
+
+
+订单服务调用库存服务（RPC 调用的链路传递）
+3.1 业务层面
+订单服务的OrderController.create()方法调用OrderService.createOrder()，然后通过 OpenFeign 调用库存服务的扣减接口：
+
+
+@PostMapping("/create")
+public ResponseEntity<OrderVO> create(@RequestBody OrderDTO dto) {
+    Order order = orderService.createOrder(dto); // 这里会调用库存服务
+    return ResponseEntity.ok(convert(order));
+}
+
+@Service
+public class OrderService {
+    @Autowired
+    private InventoryFeignClient inventoryFeignClient;
+    
+    public Order createOrder(OrderDTO dto) {
+        // 1. 生成订单
+        Order order = new Order();
+        order.setUserId(dto.getUserId());
+        order.setProductId(dto.getProductId());
+        order.setCount(dto.getCount());
+        orderRepository.save(order);
+        
+        // 2. 调用库存服务扣减库存
+        inventoryFeignClient.deduct(dto.getProductId(), dto.getCount()); // Feign调用
+        
+        // 3. 发送消息
+        rocketMQTemplate.convertAndSend("order_created", order);
+        
+        return order;
+    }
+}
+
+
+
+
+
+
+3.2 SkyWalking 底层：Feign 调用的上下文传递
+探针已经预增强了 OpenFeign 的FeignClient类：
+拦截 Feign 调用：拦截FeignClient.execute()方法的入口
+生成新的 Span：
+SpanID：1（订单服务 Segment 内的第二个 Span，ID 自增）
+parentSpanID：0（订单服务的根 SpanID）
+operationName：GET:/api/inventory/deduct
+startTime：1714200000030
+tags：rpc.type=feign、rpc.service=inventory-service、rpc.method=deduct
+生成新的 sw8 头：把当前订单服务的上下文编码成新的 sw8 头，加到 Feign 的 HTTP 请求里
+新的 sw8 头里，父 SpanID 变成了1（订单服务的这个 SpanID），父服务名变成了order-service
+发起 HTTP 请求：Feign 把带 sw8 头的请求发送给库存服务
+结束 Span：收到库存服务的响应后，记录 endTime 和 duration（本次耗时 20ms），把 Span 加入当前 Segment
+
+
+
+
+
+
+
+为什么 Feign 能自动传递 sw8 头？：SkyWalking 的 Feign 插件在增强时，自动在请求拦截器里加了request.header("sw8", TraceContext.getSw8())
+如果用原生 HttpClient 怎么办？：原生 HttpClient 没有被增强，需要手动加 sw8 头，否则链路断裂
+这里最容易出的问题：
+没有引入 Feign 插件：skywalking-agent/plugins目录下没有apm-feign-plugin-9.x.jar
+自定义 Feign 拦截器覆盖了 sw8 头：如果你的拦截器里重新设置了所有请求头，会把 sw8 头覆盖掉，需要手动保留
+
+
+
+
+
+阶段 4：库存服务执行 SQL（数据库链路采集）
+4.1 业务层面
+库存服务收到 Feign 请求，执行InventoryService.deduct()方法，通过 MyBatis 更新数据库
+
+@Service
+public class InventoryService {
+    @Autowired
+    private InventoryMapper inventoryMapper;
+    
+    @Transactional
+    public void deduct(Long productId, Integer count) {
+        int rows = inventoryMapper.deduct(productId, count); // 执行UPDATE SQL
+        if (rows == 0) {
+            throw new RuntimeException("库存不足");
+        }
+    }
+}
+
+
+
+
+
+
+
+
+4.2 SkyWalking 底层：SQL 语句的采集
+探针已经预增强了 MyBatis 的MapperProxy类和 JDBC 的PreparedStatement类：
+拦截 Mapper 方法调用：拦截MapperProxy.invoke()方法，生成一个 Span
+SpanID：0（库存服务 Segment 的根 SpanID）
+parentSpanID：1（订单服务的 Feign 调用 SpanID）
+operationName：InventoryService.deduct
+拦截 JDBC 执行：拦截PreparedStatement.execute()方法，生成一个子 Span
+SpanID：1（库存服务 Segment 内的第二个 Span）
+parentSpanID：0（库存服务的根 SpanID）
+operationName：UPDATE inventory SET count = count - ? WHERE product_id = ?
+startTime：1714200000040
+tags：db.type=mysql、db.instance=inventory_db、db.sql=UPDATE inventory SET count = count - 2 WHERE product_id = 456
+执行 SQL：数据库执行 SQL，耗时 15ms
+结束 SQL Span：记录 endTime 和 duration，把 SQL Span 加入库存服务的 Segment
+结束库存服务根 Span：返回响应给订单服务，记录 endTime 和 duration（本次总耗时 25ms）
+
+
+
+
+
+4.3 关键底层细节
+SQL 参数怎么采集？：默认是关闭的，需要在agent.config里设置plugin.jdbc.trace_sql_parameters=true，开启后会把?替换成真实的参数值
+为什么有时候看不到完整 SQL？：
+没有引入 JDBC 插件：plugins目录下没有apm-jdbc-plugin-9.x.jar
+使用了不支持的数据库驱动：比如某些国产数据库的驱动没有被增强
+这里最容易出的问题：SQL 耗时很长，但在链路里看不到，90% 是因为没有引入 JDBC 插件
+
+
+
+
+
+阶段 5：订单服务发送 RocketMQ 消息（消息队列链路传递）
+
+
+5.1 业务层面
+订单服务收到库存服务的响应后，发送一条消息到 RocketMQ 的order_created主题：
+java
+运行
+rocketMQTemplate.convertAndSend("order_created", order);
+
+
+5.2 SkyWalking 底层：消息队列的上下文传递
+探针已经预增强了 RocketMQ 的DefaultMQProducer类：
+拦截消息发送：拦截DefaultMQProducer.send()方法，生成一个 Span
+SpanID：2（订单服务 Segment 内的第三个 Span）
+parentSpanID：0（订单服务的根 SpanID）
+operationName：RocketMQ/order_created/producer
+startTime：1714200000055
+tags：mq.broker=broker1、mq.topic=order_created
+上下文存入消息属性：把当前 TraceID、SpanID 编码成sw8，加到消息的properties里
+消息属性里会多一个sw8字段，值和当前上下文的 sw8 头相同
+发送消息：RocketMQ 把消息发送到 Broker
+结束 Span：收到 Broker 的确认后，记录 endTime 和 duration（本次耗时 5ms）
+
+
+
+5.3 关键底层细节
+消费者怎么拿到 TraceID？：消费者端的探针会拦截MessageListener.consumeMessage()方法，从消息的properties里取出sw8，解码后设置到自己的 ThreadLocal 里，生成子 Span
+这里最容易出的问题：
+没有引入 RocketMQ 插件：plugins目录下没有apm-rocketmq-plugin-9.x.jar
+自定义消息序列化器覆盖了 properties：如果你的序列化器没有保留消息的 properties，会把 sw8 属性覆盖掉，链路断裂
+
+
+
+
+阶段 6：响应返回用户 → 所有 Span 结束
+6.1 业务层面
+订单服务完成所有操作，返回响应给 Nginx，Nginx 再返回给用户浏览器：
+http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code": 200, "data": {"orderId": 123456}}
+6.2 SkyWalking 底层：所有 Span 结束，Segment 上报
+订单服务根 Span 结束：DispatcherServlet.doDispatch()方法执行完成，探针拦截方法出口，记录 endTime 和 duration（本次总耗时 60ms）
+订单服务 Segment 组装完成：把订单服务内的所有 Span（ID=0、1、2）组装成一个完整的 Segment
+Nginx 根 Span 结束：Nginx 收到订单服务的响应，记录 endTime 和 duration（本次总耗时 70ms）
+批量上报数据：探针会把 Segment 数据批量、压缩后，通过 gRPC 协议发送给 SkyWalking OAP 服务器
+上报地址：collector.backend_service=oap-server:11800
+批量大小：默认 512 个 Segment，或者每 1 秒上报一次
+压缩算法：gzip，减少网络传输量
+6.3 关键底层细节
+为什么要批量上报？：如果每个 Span 都单独上报，会给 OAP 服务器造成巨大的压力，批量上报能大幅减少网络 IO 和 CPU 消耗
+上报失败怎么办？：探针会把失败的 Segment 存入本地内存队列，重试 3 次，还是失败就丢弃（避免影响业务）
+这里最容易出的问题：
+OAP 服务器地址配置错误：agent.config里的collector.backend_service写错了
+网络不通：服务和 OAP 服务器之间的 11800 端口没有开放
+探针版本和 OAP 版本不兼容：比如用 8.x 的探针连 9.x 的 OAP，会上报失败
+阶段 7：OAP 后端处理 → UI 展示（数据的最终归宿）
+7.1 OAP 服务器处理流程
+Receiver 接收数据：gRPC 接收器收到探针发来的 Segment 数据
+Analyzer 分析数据：
+按 TraceID 分组：把来自不同服务的 Segment，按同一个 TraceID 归为一组
+组装父子 Span：根据每个 Span 的parentSpanID和parentSegmentID，把所有 Span 串成一个树形结构
+计算指标：统计每个服务、每个接口的请求数、平均耗时、P99 耗时、错误率
+Storage 存储数据：把处理后的数据存入 Elasticsearch
+Trace 数据存在sw_trace_${日期}索引
+指标数据存在sw_metrics_${日期}索引
+日志数据存在sw_log_${日期}索引
+Query 提供查询接口：给 UI 层提供 RESTful 查询接口
+7.2 UI 层展示流程
+用户在 SkyWalking UI 上点击「追踪」页面，选择时间范围和服务
+UI 调用 OAP 的查询接口，获取符合条件的 Trace 列表
+点击某个 TraceID，OAP 从 Elasticsearch 中取出所有相关的 Span，组装成火焰图
+火焰图上的每个横条对应一个 Span，长度代表耗时，颜色代表类型（HTTP = 蓝色，RPC = 绿色，数据库 = 橙色）
+点击某个 Span，就能看到它的所有属性：operationName、startTime、duration、tags、logs（异常堆栈）
+终极总结：整个流程的核心脉络
+plaintext
+用户请求 → Nginx（生成TraceID+根Span+sw8头）
+          ↓
+订单服务（解析sw8→生成Segment→生成Span→调用Feign）
+          ↓
+库存服务（解析sw8→生成Segment→执行SQL→返回）
+          ↓
+订单服务（发送MQ→结束Span→组装Segment→上报OAP）
+          ↓
+OAP（按TraceID分组→组装链路→存入ES）
+          ↓
+UI（查询ES→生成火焰图→展示）
+排查错误的核心思路（看完直接用）
+TraceID 断裂（只有部分 Span）：
+第一步：看第一个断裂的服务，检查它的探针是否加载
+第二步：检查上游服务是否转发了 sw8 头（抓包看请求头里有没有 sw8）
+第三步：检查是否有异步操作（线程池、CompletableFuture）导致上下文丢失
+看不到 SQL/Redis/MQ 的 Span：
+检查skywalking-agent/plugins目录下有没有对应的插件
+检查插件版本和探针版本是否一致
+数据没有上报到 OAP：
+检查agent.config里的collector.backend_service是否正确
+检查服务和 OAP 之间的 11800 端口是否通（telnet oap-server 11800）
+看应用启动日志里有没有 SkyWalking 的报错信息
+TraceID 在跨线程后消失：
+使用 SkyWalking 提供的TraceableExecutorService包装线程池
+不要用new Thread()，用 Spring 的@Async注解（SkyWalking 会自动增强）
+
+
+
+
+
+
+
+
+
+
+一、先把 Segment 的本质钉死
+你可以把 Segment 理解成：一个 JVM 进程对同一个请求的 "工作记录单"
+Trace = 整个公司的完整快递单（全程唯一）
+Segment = 某个快递站点的工作记录单（每个站点一张）
+Span = 快递员在这个站点做的每一件事（卸货、分拣、装车）
+一个 Trace 横跨多少个独立的 JVM 进程，就会有多少个 Segment。每个 Segment 只记录自己这个进程内发生的所有操作，然后独立上报给 OAP，最后由 OAP 把所有 Segment 按 TraceID 串成完整的链路。
+
+
+
+
+二、Segment 的严格创建规则（一个字都不能错）
+
+
+
+✅ 一定会创建新 Segment 的情况
+
+
+请求第一次进入一个全新的 JVM 进程
+比如 Nginx→订单服务：订单服务是新的 JVM，创建新 Segment
+订单服务→库存服务：库存服务是新的 JVM，创建新 Segment
+生产者发送 MQ→消费者处理：消费者是新的 JVM，创建新 Segment
+
+
+同一个请求多次调用同一个服务
+比如订单服务循环调用库存服务 3 次扣减库存
+每次调用都会在库存服务创建一个全新的 Segment
+这 3 个 Segment 的 TraceID 相同，但 SegmentID 不同，父 SpanID 分别对应订单服务的 3 次 Feign 调用 Span
+
+
+
+异步任务的独立执行
+比如订单服务用@Async提交一个异步任务
+这个异步任务不会创建新 Segment，它的所有 Span 都会被包含在订单服务的同一个 Segment 里
+但如果异步任务调用了其他服务，被调用的服务会创建新 Segment
+
+
+
+❌ 绝对不会创建新 Segment 的情况
+
+
+同一个 JVM 进程内的任何方法调用
+不管是 Controller→Service→DAO，还是 Service 内部的私有方法调用
+不管开多少个线程、用多少个线程池，只要是同一个请求、同一个 JVM
+所有 Span 都属于同一个 Segment
+
+同一个 JVM 进程内的本地缓存调用
+比如调用 Redis、本地 Caffeine 缓存
+只会生成对应的 Span，不会创建新 Segment
+
