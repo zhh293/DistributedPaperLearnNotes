@@ -1,0 +1,378 @@
+所以说多个go协程交给了可能一个内核线程进行管理，
+100万协程可能只有几个内核线程来管理，
+上下文切换的时间大大减少，频率也大大降低，
+占用内存也大大减少，可能说一个内核线程执行一会之后时间片耗尽，
+换到另一个线程执行他所管理的协程，然后线程执行这个协程超过10ms，
+就会自己换到另一个协程去执行，
+就好像是底层的内核线程时间片耗尽切换了一样，
+其实还是一个内核线程在执行。
+对吧，所以说你能不能用伪代码让我看看这个go底层如何精妙的操控这些协程的
+
+// ============== Go运行时核心数据结构（简化但更准确） ==============
+package runtime
+
+// 1. G: goroutine
+type g struct {
+    sched       gobuf         // 保存的上下文（sp栈指针, pc程序计数器等）
+    stack       stack         // 栈信息（包含栈底和栈顶）
+    stackguard0 uintptr       // 用于栈溢出检查
+    m           *m            // 当前绑定的M（可以为nil）
+    schedlink   guintptr      // 链接到下一个g（队列中使用）
+    goid        int64         // goroutine ID
+    status      uint32        // 状态：_Gidle, _Grunnable, _Grunning, _Gwaiting...
+    lockedm     *m            // 锁定的M（用于系统调用）
+    preempt     bool          // 抢占标志（关键！1.14+引入的信号抢占）
+    preemptStop bool          // 抢占时是否停止
+    starttime   int64         // 开始执行时间（用于抢占）
+}
+
+// 保存的寄存器上下文
+type gobuf struct {
+    sp   uintptr    // 栈指针
+    pc   uintptr    // 程序计数器
+    g    guintptr   // 指向g自己
+    ctxt unsafe.Pointer
+    ret  uintptr
+    lr   uintptr
+    bp   uintptr
+}
+
+// 2. M: 机器线程（内核线程）
+type m struct {
+    g0      *g       // 调度栈使用的goroutine（特殊的系统goroutine）
+    curg    *g       // 当前正在执行的用户goroutine
+    p       puintptr // 当前绑定的P（可以为nil）
+    nextp   puintptr // 下一个要绑定的P
+    id      int64    // M ID
+    park    note     // 用于休眠/唤醒
+    schedlink muintptr
+    spinning bool    // 是否在自旋寻找工作
+    lockedg  *g      // 锁定的G（用于cgo等）
+}
+
+// 3. P: 处理器（调度上下文）
+type p struct {
+    id          int32
+    status      uint32 // _Pidle, _Prunning, _Psyscall...
+    link        puintptr
+    m           muintptr // 绑定的M（可以为nil）
+    
+    // 本地可运行队列
+    runqhead uint32
+    runqtail uint32
+    runq     [256]guintptr  // 环形队列，容量256
+    
+    runnext guintptr        // 高优先级的下一个G（用于快速路径）
+    
+    // 统计和调度
+    schedtick uint32        // 每次调度增加
+    syscalltick uint32
+    lastpoll   uint64       // 上次网络轮询时间
+}
+
+// ============== 调度器核心逻辑（更准确的伪代码） ==============
+
+// 全局调度器
+type schedt struct {
+    lock mutex
+    
+    // 全局可运行队列（当P本地队列满时使用）
+    runq     gQueue
+    runqsize int32
+    
+    // M池
+    midle      muintptr // 空闲M链表
+    nmidle     int32    // 空闲M数量
+    
+    // P池
+    pidle      puintptr // 空闲P链表
+    npidle     uint32   // 空闲P数量
+    
+    // 系统监控（sysmon）
+    sysmonwait uint32
+}
+
+// ============== 1. 调度循环（schedule函数，每个M的核心循环） ==============
+// 这个函数在g0栈上执行
+func schedule() {
+    _g_ := getg()  // 获取当前g（当前是g0）
+    mp := _g_.m
+    
+top:
+    // 1. 检查GC等特殊任务
+    if gp == nil {
+        // 检查全局可运行队列（每61次调度检查一次，避免锁竞争）
+        if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+            lock(&sched.lock)
+            gp = globrunqget(_g_.m.p.ptr(), 1)
+            unlock(&sched.lock)
+        }
+    }
+    
+    // 2. 从本地队列获取（主要路径）
+    if gp == nil {
+        gp, _ = runqget(_g_.m.p.ptr())
+        if gp && _g_.m.spinning {
+            throw("schedule: spinning with local work")
+        }
+    }
+    
+    // 3. 尝试从其他P窃取（work-stealing）
+    if gp == nil {
+        gp, inheritTime = findrunnable() // 可能阻塞
+    }
+    
+    // 4. 执行goroutine
+    execute(gp, inheritTime)
+}
+
+// ============== 2. 执行goroutine（execute函数） ==============
+func execute(gp *g, inheritTime bool) {
+    _g_ := getg()  // g0
+    mp := _g_.m
+    
+    // 绑定g到当前M
+    mp.curg = gp
+    gp.m = mp
+    
+    // 切换上下文（从g0栈切换到用户goroutine栈）
+    gogo(&gp.sched)
+}
+
+// ============== 3. goroutine切换的汇编入口（gogo函数） ==============
+// 汇编实现，主要做两件事：
+// 1. 恢复goroutine的寄存器上下文（sp, pc等）
+// 2. 跳转到goroutine上次暂停的位置继续执行
+TEXT runtime·gogo(SB), NOSPLIT, $0-8
+    // 从gobuf恢复寄存器
+    MOVQ gobuf_sp(BX), SP
+    MOVQ gobuf_pc(BX), AX
+    JMP  AX  // 跳转到goroutine的代码继续执行
+
+// ============== 4. goroutine让出CPU（goschedImpl函数） ==============
+// 当goroutine主动让出（runtime.Gosched）或被动抢占时调用
+func goschedImpl(gp *g) {
+    status := readgstatus(gp)
+    if status&^_Gscan != _Grunning {
+        dumpgstatus(gp)
+        throw("bad g status")
+    }
+    
+    // 保存当前上下文
+    casgstatus(gp, _Grunning, _Grunnable)
+    save(gp)  // 保存栈指针、pc等到gp.sched
+    
+    // 将goroutine放回全局队列
+    dropg()
+    lock(&sched.lock)
+    globrunqput(gp)
+    unlock(&sched.lock)
+    
+    // 重新调度
+    schedule()
+}
+
+// ============== 5. 系统监控（sysmon函数） ==============
+// 在独立的M上运行，负责抢占等任务
+func sysmon() {
+    for {
+        // 每20us~10ms检查一次
+        delay := uint32(20)
+        if idle == 0 { // 没有空闲P
+            delay = 10 * 1000 // 10ms
+        }
+        
+        // 休眠一段时间
+        notetsleep(&sched.sysmonnote, delay)
+        
+        // 检查运行时间过长的goroutine
+        for i := 0; i < len(allp); i++ {
+            p := allp[i]
+            if p == nil {
+                continue
+            }
+            
+            // 检查当前正在运行的goroutine是否运行超过10ms
+            s := p.status
+            if s == _Prunning || s == _Psyscall {
+                // 获取当前运行的goroutine
+                gp := p.m.ptr().curg
+                if gp == nil {
+                    continue
+                }
+                
+                // 计算运行时间
+                t := int64(atomic.Load64(&sched.sysmonclock))
+                if t-gp.starttime > 10*1000*1000 { // 10ms
+                    // 发送抢占信号（异步抢占）
+                    preemptone(p)
+                }
+            }
+        }
+    }
+}
+
+// ============== 6. 异步抢占（preemptone函数） ==============
+func preemptone(p *p) bool {
+    mp := p.m.ptr()
+    if mp == nil || mp == getg().m {
+        return false
+    }
+    
+    gp := mp.curg
+    if gp == nil || gp == mp.g0 {
+        return false
+    }
+    
+    // 设置抢占标志
+    gp.preempt = true
+    
+    // 在栈溢出检查处插入抢占点
+    gp.stackguard0 = stackPreempt
+    
+    // 向M发送信号（POSIX系统使用SIGURG）
+    if mp.signalPending == 0 {
+        mp.signalPending = 1
+        // 发送信号给M，M会在信号处理程序中处理抢占
+        signalM(mp, sigPreempt)
+    }
+    
+    return true
+}
+
+// ============== 7. 信号处理（处理抢占） ==============
+// 当M收到SIGURG信号时，会调用此函数
+func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
+    if sig == sigPreempt {
+        // 检查是否真的需要抢占
+        if wantAsyncPreempt(gp) {
+            // 保存当前goroutine的上下文
+            save(gp)
+            
+            // 调用异步抢占函数
+            doAsyncPreempt(gp)
+        }
+        return
+    }
+    // ... 其他信号处理
+}
+
+// ============== 8. 异步抢占实现 ==============
+func doAsyncPreempt(gp *g) {
+    // 在gp的栈上插入一个异步抢占调用
+    // 当goroutine从信号处理返回时，会执行这个调用
+    
+    // 保存所有寄存器状态到gp.sched
+    saveToGobuf(&gp.sched, getcallerpc())
+    
+    // 修改返回地址，使其返回到异步抢占处理代码
+    gp.sched.pc = uintptr(asyncPreempt)
+    
+    // 标记goroutine为可运行状态
+    casgstatus(gp, _Grunning, _Grunnable)
+    
+    // 将goroutine放回队列
+    dropg()
+    lock(&sched.lock)
+    globrunqput(gp)
+    unlock(&sched.lock)
+    
+    // 当前M继续调度
+    schedule()
+}
+
+// ============== 9. M的启动（mstart函数） ==============
+// 当OS线程创建时，从这里开始执行
+func mstart() {
+    _g_ := getg()
+    
+    // 确保在g0栈上
+    if _g_ != _g_.m.g0 {
+        throw("bad runtime·mstart")
+    }
+    
+    // 调度循环
+    mstart1()
+}
+
+func mstart1() {
+    _g_ := getg()
+    
+    // 初始化M
+    minit()
+    
+    // 如果当前有初始化函数，执行它
+    if fn := _g_.m.mstartfn; fn != nil {
+        fn()
+    }
+    
+    // 如果当前没有绑定P，尝试获取一个
+    if _g_.m.p == 0 {
+        acquirep(_g_.m.nextp.ptr())
+        _g_.m.nextp = 0
+    }
+    
+    // 进入调度循环
+    schedule()
+}
+关键修正点说明：
+抢占机制修正：
+
+原伪代码在executeG中轮询检查10ms是不准确的
+
+Go 1.14+使用异步抢占：sysmon监控goroutine运行时间，超时后发送信号(SIGURG)给M
+
+M在信号处理程序中保存上下文并触发调度
+
+上下文切换修正：
+
+不是简单的saveGContext函数调用
+
+实际是通过汇编gogo和save函数保存/恢复寄存器状态
+
+切换发生在：a) goroutine主动让出 b) 函数调用时检查抢占标志 c) 信号处理
+
+队列结构修正：
+
+P的本地队列是环形队列，不是切片
+
+有runnext字段用于快速执行（最近创建的goroutine）
+
+调度入口修正：
+
+M从mstart开始，最终进入schedule()循环
+
+每个M有特殊的g0用于调度（有独立的栈）
+
+工作窃取修正：
+
+findrunnable()函数实现工作窃取算法
+
+当本地队列空时，从其他P窃取一半任务
+
+系统调用处理修正：
+
+原伪代码缺少系统调用时的处理
+
+实际Go中，系统调用会解除P和M的绑定，让P可以服务其他M
+
+真实的调度流程：
+text
+OS创建线程 → mstart() → 获取P → schedule()循环:
+    1. 从本地队列取G
+    2. 本地队列空则窃取
+    3. 执行G (execute)
+    4. G运行中...
+        情况A: G主动让出 (goschedImpl)
+        情况B: 函数调用时检查到抢占标志
+        情况C: 收到抢占信号 (SIGURG)
+    5. 保存G上下文，放回队列
+    6. 回到步骤1
+你的理解基本正确，但实际实现更复杂：
+"一个内核线程管理多个协程"：✓ 正确，M通过schedule()循环不断切换G
+
+"10ms抢占"：✓ 但机制不同，是通过sysmon监控+信号实现的异步抢占
+
+"上下文切换快"：✓ 仅保存必要寄存器，无内核参与
+
+"少线程多协程"：✓ M数量≈CPU核心数，P数量固定为CPU核心数
