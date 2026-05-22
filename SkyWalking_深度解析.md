@@ -1891,6 +1891,164 @@ public class OrderController {
 
 **到这里**，你已经有了一个能手动使用的链路追踪 SDK。但手动埋点的问题是：每个方法都要写 try-finally、每个 HTTP 调用都要手动注入 Header——太繁琐了。接下来实现自动化。
 
+#### 8.3.6 四大核心组件的角色定位与协作关系（架构串讲）
+
+上面分别给出了四个类的代码实现，但如果你只看代码，很容易陷入"知道每个类怎么写，但不知道它们为什么存在、在哪里发挥作用"的困境。这一节就把它们彻底串起来。
+
+**先建立一个核心认知：这四个组件解决的是"谁来管 Span"和"怎么跨边界传递 TraceId"两个问题。**
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                          一次请求的完整追踪                              │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  【角色定位】                                                           │
+│                                                                        │
+│  ContextManager ─── "前台接待" ── 唯一的静态入口，谁都找它              │
+│       │                                                                │
+│       │ 内部持有 ThreadLocal<TracingContext>                            │
+│       ▼                                                                │
+│  TracingContext ─── "车间主管" ── 每个线程一个，管理本线程全部 Span      │
+│       │                                                                │
+│       │ 管理 Span 栈 + 持有 TraceSegment                              │
+│       │                                                                │
+│       │ 需要跨进程？ ────→ ContextCarrier ─── "快递包裹"              │
+│       │                     把 traceId/segmentId/spanId 打包            │
+│       │                     序列化成字符串塞进 HTTP Header               │
+│       │                                                                │
+│       │ 需要跨线程？ ────→ ContextSnapshot ─── "便签纸条"             │
+│       │                     和 Carrier 几乎一样的信息                   │
+│       │                     但不需要序列化（同一个 JVM 内存传递即可）     │
+│       │                                                                │
+│       ▼                                                                │
+│  TraceSegment ─── "成品箱" ── 收集本线程所有完成的 Span，最终上报       │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**用一句话定义每个组件的职责：**
+
+| 组件 | 一句话定义 | 生命周期 | 数量关系 |
+|------|-----------|---------|---------|
+| ContextManager | 全局唯一的静态门面，所有追踪操作的统一入口 | 进程级别，永远存在 | 整个 JVM 只有一个（静态类） |
+| TracingContext | 某个线程在某次请求中的完整追踪状态 | 从该线程第一个 Span 创建到最后一个 Span 结束 | 每个线程同一时刻最多一个（ThreadLocal） |
+| ContextCarrier | 跨进程传递追踪信息的"信封" | 临时对象，序列化写入 Header 后就没用了 | 每次跨进程调用创建一个 |
+| ContextSnapshot | 跨线程传递追踪信息的"便条" | 临时对象，子线程 continued 之后就没用了 | 每次跨线程提交创建一个 |
+
+**从信息流的角度理解它们在哪里出现：**
+
+```
+Service A (线程1)                    网络                  Service B (线程X)
+─────────────────                   ─────                 ─────────────────
+
+[ContextManager]                                          [ContextManager]
+      │ createEntrySpan()                                       │
+      ▼                                                         │
+[TracingContext-A]                                               │
+      │ createExitSpan()                                        │
+      │ inject(carrier)                                         │
+      ▼                                                         │
+[ContextCarrier] ──serialize──→ HTTP Header ──deserialize──→ [ContextCarrier]
+                                                                │
+                                                          [ContextManager]
+                                                                │ createEntrySpan(carrier)
+                                                                ▼
+                                                          [TracingContext-B]
+                                                                │ extract(carrier)
+                                                                │   → 用A的traceId覆盖自己的
+                                                                │   → 建立SegmentRef指向A
+                                                                ▼
+                                                          两个Segment共享同一个traceId
+                                                          Collector 靠 SegmentRef 还原顺序
+```
+
+```
+Service A 内部（跨线程场景）
+
+主线程                                          子线程
+────────                                        ────────
+
+[ContextManager]                                
+      │ 正在处理请求...                         
+      │ capture()                               
+      ▼                                         
+[ContextSnapshot] ──内存传递──→ 提交给线程池 ──→ [ContextManager]
+                   （作为Runnable字段）                │ continued(snapshot)
+                                                      ▼
+                                                [TracingContext-子线程]
+                                                      │ 和主线程共享 traceId
+                                                      │ SegmentRef 指向主线程 Segment
+                                                      ▼
+                                                子线程的 Span 也归属同一条 Trace
+```
+
+**为什么需要这四个而不是更少？分层的设计意图：**
+
+你可能会想："TracingContext 已经持有了所有信息，为什么还需要 ContextManager？直接用 TracingContext 不行吗？"
+
+答案是**职责分离**：
+
+1. **ContextManager 解决的是"在哪存、怎么取"的问题**——它用 ThreadLocal 把 TracingContext 绑定到当前线程，让任何位置（拦截器、Filter、业务代码）都能通过 `ContextManager.activeSpan()` 拿到当前 Span，而不需要把 context 对象一路作为参数往下传。这是典型的"隐式上下文传播"模式。
+
+2. **TracingContext 解决的是"怎么管 Span"的问题**——它维护了 Span 栈，知道 Span 的嵌套关系，负责 Span 的创建/复用/结束/归档，以及最终触发 Segment 上报。它是纯粹的状态管理器。
+
+3. **ContextCarrier 和 ContextSnapshot 解决的是"怎么跨边界"的问题**——TracingContext 被 ThreadLocal 绑死在一个线程里，当追踪信息需要"离开"当前线程（无论是去另一个进程还是去另一个线程），就必须有一个独立的数据载体把关键信息"搬运"出去。Carrier 和 Snapshot 就是这个载体，它们的区别仅仅在于：前者需要序列化成字符串穿越网络，后者是 JVM 内存直接传引用。
+
+**最终的协作时序（一个完整请求从 A→B 的全过程）：**
+
+```
+时间线 →→→
+
+Service A：
+  1. 请求到达 → ContextManager.createEntrySpan("POST:/order", null)
+     └→ ContextManager 内部：getOrCreate() 创建 TracingContext-A（绑定 ThreadLocal）
+     └→ TracingContext-A：创建 EntrySpan，压入 Span 栈
+     
+  2. 业务逻辑...
+  
+  3. 需要调用 B → ContextManager.createExitSpan("/api/inventory", carrier, "B:8080")
+     └→ TracingContext-A：创建 ExitSpan，压入 Span 栈
+     └→ TracingContext-A.inject(carrier)：把 traceId、segmentId、spanId 写入 carrier
+     └→ 调用方代码：carrier.serializeTo() → 放入 HTTP Header
+     
+  4. 收到 B 的响应 → ContextManager.stopSpan()  // 结束 ExitSpan
+  
+  5. 请求处理完毕 → ContextManager.stopSpan()  // 结束 EntrySpan
+     └→ TracingContext-A：Span 栈清空 → Segment 完成 → 触发上报
+     └→ ContextManager：CONTEXT.remove()  // 清理 ThreadLocal
+
+Service B：
+  1. 请求到达 → 从 Header 取出字符串 → carrier.deserializeFrom(headerValue)
+  
+  2. ContextManager.createEntrySpan("GET:/api/inventory", carrier)
+     └→ ContextManager：getOrCreate() 创建 TracingContext-B
+     └→ TracingContext-B：创建 EntrySpan
+     └→ TracingContext-B.extract(carrier)：
+         • segment.relatedGlobalTraceId(carrier.getTraceId())  ← 关键：统一 traceId
+         • segment.ref(new TraceSegmentRef(carrier))           ← 关键：记录父 Segment 信息
+         
+  3. 业务处理...
+  
+  4. ContextManager.stopSpan() → Segment-B 完成上报
+
+Collector：
+  - 收到 Segment-A 和 Segment-B
+  - 发现它们的 traceId 相同 → 属于同一条链路
+  - Segment-B 有 SegmentRef 指向 Segment-A → 知道 B 是 A 调出来的
+  - 还原出完整调用链：A.EntrySpan → A.ExitSpan → B.EntrySpan → ...
+```
+
+**总结一下这个"分工协作"的心智模型：**
+
+把整个追踪系统想象成一个快递公司：
+
+- **ContextManager** = 快递公司的客服热线（统一入口，你打电话说"我要寄快递"或"我的快递到哪了"，它去调度后台）
+- **TracingContext** = 某个配送站点的仓管（管理这个站点/线程内所有在途的包裹/Span，谁先来谁后到，嵌套关系都清楚）
+- **ContextCarrier** = 跨城的快递单（把寄件人信息序列化写在单子上，贴在包裹/HTTP请求上，寄到另一个城市/进程）
+- **ContextSnapshot** = 同城内部的交接单（信息一样，但不用序列化，直接内部交接/内存传递就行）
+
+有了这个认知模型，再回头看代码就能理解每一行"为什么这样写"了。
+
 ---
 
 ### 8.4 Phase 3：Java Agent 自动字节码增强（核心难点）
