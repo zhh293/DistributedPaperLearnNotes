@@ -3285,3 +3285,1623 @@ Agent 集群                    消息队列               Collector 集群     
 ---
 
 > 至此，你已经完全理解了从零实现一个类 SkyWalking 链路追踪系统的全部思路、架构和核心代码。动手实现它是深入理解分布式系统可观测性的最佳方式。
+
+---
+
+## 9. 复杂请求流程全链路超详细解析（源码级 Walkthrough）
+
+本章通过一个精心设计的复杂场景，将 SkyWalking 中的插件机制、拦截器执行、上下文管理、跨进程传播、跨线程传播、Span 栈操作、Segment 生命周期、数据上报等核心设计一次性串起来。每一步都从"外部发生了什么"→"哪个插件/拦截器被触发"→"源码中执行了什么方法"→"数据结构发生了什么变化"四个维度进行详解。
+
+### 9.1 场景描述
+
+```
+用户浏览器 → Gateway（Spring Cloud Gateway）→ OrderService → [异步线程池] → NotificationService
+                                              → InventoryService → MySQL
+                                              → PaymentService（通过 RocketMQ 异步）
+```
+
+**完整调用链路：**
+
+1. 用户发起 HTTP 请求 `POST /api/order/create` 到 Gateway
+2. Gateway 路由转发到 OrderService
+3. OrderService 收到请求后：
+   - a. 同步调用 InventoryService 扣减库存（HTTP）
+   - b. InventoryService 内部查询 MySQL 确认库存
+   - c. OrderService 将订单消息发送到 RocketMQ
+   - d. OrderService 提交异步任务到线程池，通知用户（跨线程）
+4. PaymentService 消费 RocketMQ 消息，处理支付
+
+**涉及的 SkyWalking 设计：**
+
+| 设计点 | 在哪一步体现 |
+|--------|-------------|
+| Tomcat 插件 EntrySpan | OrderService、InventoryService 接收 HTTP |
+| Spring Cloud Gateway 插件 | Gateway 路由转发 |
+| HttpClient 插件 ExitSpan + inject | OrderService → InventoryService |
+| MySQL/JDBC 插件 ExitSpan（无 inject） | InventoryService → MySQL |
+| RocketMQ Producer 插件 ExitSpan + inject | OrderService 发送消息 |
+| RocketMQ Consumer 插件 EntrySpan + extract | PaymentService 消费消息 |
+| 线程池插件 capture/continued | OrderService 异步通知 |
+| Segment 生命周期管理 | 每个线程 Segment 的创建与上报 |
+| sw8 协议序列化/反序列化 | 每次跨进程传播 |
+
+**最终产生的 Segment 数量：5 个**
+
+| Segment | 所在进程/线程 |
+|---------|-------------|
+| Segment-1 | Gateway 主线程 |
+| Segment-2 | OrderService 主线程 |
+| Segment-3 | InventoryService 主线程 |
+| Segment-4 | OrderService 异步线程（通知任务） |
+| Segment-5 | PaymentService 消费者线程 |
+
+---
+
+### 9.2 第一步：请求到达 Gateway
+
+#### 外部视角
+
+用户浏览器发送 `POST /api/order/create`，请求到达 Spring Cloud Gateway。这是整条链路的起点，HTTP 请求中没有 `sw8` Header。
+
+#### 插件与拦截器
+
+Spring Cloud Gateway 插件拦截 `org.springframework.cloud.gateway.filter.NettyRoutingFilter` 的 `filter` 方法。
+
+```
+插件定义文件：spring-cloud-gateway-2.x-plugin / skywalking-plugin.def
+增强类：org.springframework.cloud.gateway.filter.NettyRoutingFilter
+拦截方法：filter(ServerWebExchange, GatewayFilterChain)
+拦截器：Spring2xNettyRoutingFilterInterceptor
+```
+
+#### 源码执行详解
+
+**beforeMethod 阶段：**
+
+```java
+// Spring2xNettyRoutingFilterInterceptor.beforeMethod()
+
+// 1. 从 ServerWebExchange 中获取请求信息
+ServerWebExchange exchange = (ServerWebExchange) allArguments[0];
+ServerHttpRequest request = exchange.getRequest();
+String operationName = request.getPath().value();  // "/api/order/create"
+
+// 2. 尝试从请求头提取上游上下文（首次请求没有 sw8 Header，所以 carrier 为空）
+ContextCarrier contextCarrier = new ContextCarrier();
+CarrierItem next = contextCarrier.items();
+while (next.hasNext()) {
+    next = next.next();
+    // request.getHeaders().getFirst("sw8") → null（没有上游）
+    next.setHeadValue(request.getHeaders().getFirst(next.getHeadKey()));
+}
+// carrier.isValid() == false，因为没有 sw8 Header
+
+// 3. 创建 EntrySpan
+AbstractSpan span = ContextManager.createEntrySpan(operationName, contextCarrier);
+```
+
+**ContextManager.createEntrySpan() 内部展开：**
+
+```java
+// ContextManager.java
+public static AbstractSpan createEntrySpan(String operationName, ContextCarrier carrier) {
+    // 获取或创建 TracingContext
+    AbstractTracerContext context = getOrCreate(operationName, false);
+    // ↓ 首次调用，ThreadLocal 中没有 context
+    // ↓ 所以创建全新的 TracingContext
+    
+    AbstractSpan span = context.createEntrySpan(operationName);
+    // 如果 carrier 有效，会调用 context.extract(carrier)
+    // 这里 carrier 无效（首次请求），所以跳过 extract
+    return span;
+}
+
+// getOrCreate() 展开：
+private static AbstractTracerContext getOrCreate(String operationName, boolean forceSampling) {
+    AbstractTracerContext context = CONTEXT.get();  // ThreadLocal.get()
+    if (context == null) {
+        // 采样决策
+        if (SAMPLING_SERVICE.trySampling(operationName)) {
+            // 创建真正的 TracingContext（会追踪）
+            context = new TracingContext(operationName);
+        } else {
+            // 创建 IgnoredTracerContext（不追踪，节省资源）
+            context = new IgnoredTracerContext();
+        }
+        CONTEXT.set(context);  // 绑定到 ThreadLocal
+    }
+    return context;
+}
+```
+
+**TracingContext 构造函数：**
+
+```java
+// TracingContext.java 构造
+TracingContext(String firstOPName) {
+    // 生成全局唯一的 TraceSegment
+    this.segment = new TraceSegment();
+    // ↓ TraceSegment 构造中：
+    //   this.traceSegmentId = GlobalIdGenerator.generate();  ← 全局唯一 ID
+    //   this.relatedGlobalTraceId = new NewDistributedTraceId(); ← 新 TraceId
+    //   this.spans = new ArrayList<>();
+    
+    this.activeSpanStack = new LinkedList<>();  // Span 栈，管理嵌套
+    this.spanIdGenerator = 0;  // spanId 从 0 开始递增
+}
+```
+
+**TracingContext.createEntrySpan() 执行：**
+
+```java
+// TracingContext.java
+public AbstractSpan createEntrySpan(String operationName) {
+    // 检查栈顶是否已有 EntrySpan（Span 复用机制）
+    if (isLimitMechanismWorking()) {
+        // 如果 Span 数超过配置上限（默认 300），创建 NoopSpan
+        // 防止内存溢出
+    }
+    
+    AbstractSpan entrySpan;
+    // 看栈顶有没有现成的 EntrySpan（多个 Filter/拦截器共用一个 EntrySpan）
+    final AbstractSpan parentSpan = peek();  // 栈顶 Span
+    if (parentSpan != null && parentSpan.isEntry()) {
+        // 已有 EntrySpan，复用它（只更新 operationName）
+        // 这就是为什么 Tomcat EntrySpan + Spring MVC EntrySpan 只会产生一个 Span
+        parentSpan.setOperationName(operationName);
+        entrySpan = parentSpan;
+        return entrySpan;
+    }
+    
+    // 没有现成的，创建全新 EntrySpan
+    entrySpan = new EntrySpan(spanIdGenerator++, parentSpanId, operationName);
+    // spanId = 0, parentSpanId = -1（根 Span）
+    entrySpan.start();  // 记录开始时间 startTime = System.currentTimeMillis()
+    push(entrySpan);    // 压入 activeSpanStack
+    
+    return entrySpan;
+}
+```
+
+**此时 Gateway 的数据结构状态：**
+
+```
+ThreadLocal<TracingContext>:
+  TracingContext-Gateway:
+    segment:
+      traceSegmentId: "a]b]c"  (UUID格式)
+      traceId: "x]y]z"  (全新生成)
+      spans: []  (Span 完成后才归档)
+    activeSpanStack: [EntrySpan(id=0, op="/api/order/create")]
+    spanIdGenerator: 1
+```
+
+#### Gateway 路由转发（创建 ExitSpan + inject）
+
+Gateway 将请求转发给 OrderService，这会触发 Netty HttpClient 的出口拦截：
+
+```java
+// 创建 ExitSpan 和 ContextCarrier
+ContextCarrier contextCarrier = new ContextCarrier();
+AbstractSpan exitSpan = ContextManager.createExitSpan(
+    "/api/order/create",    // 操作名
+    contextCarrier,          // 要注入的 carrier
+    "order-service:8080"     // peer（目标地址）
+);
+```
+
+**ContextManager.createExitSpan() 展开：**
+
+```java
+public static AbstractSpan createExitSpan(String operationName, 
+                                           ContextCarrier carrier, String remotePeer) {
+    // 此时 ThreadLocal 中已有 TracingContext-Gateway
+    AbstractTracerContext context = getOrCreate(operationName, false);
+    // context == TracingContext-Gateway
+    
+    AbstractSpan span = context.createExitSpan(operationName, remotePeer);
+    context.inject(carrier);  // 关键！把上下文注入 carrier
+    return span;
+}
+```
+
+**TracingContext.createExitSpan()：**
+
+```java
+public AbstractSpan createExitSpan(String operationName, String remotePeer) {
+    // 检查栈顶是否已有 ExitSpan（ExitSpan 也有复用机制）
+    AbstractSpan exitSpan;
+    final AbstractSpan parentSpan = peek();
+    
+    if (parentSpan != null && parentSpan.isExit()) {
+        // 栈顶已经是 ExitSpan → 复用
+        exitSpan = parentSpan;
+    } else {
+        // 创建新的 ExitSpan
+        int parentSpanId = parentSpan == null ? -1 : parentSpan.getSpanId();
+        exitSpan = new ExitSpan(spanIdGenerator++, parentSpanId, operationName, remotePeer);
+        // spanId = 1, parentSpanId = 0（父是 EntrySpan）
+        exitSpan.start();
+        push(exitSpan);
+    }
+    return exitSpan;
+}
+```
+
+**TracingContext.inject(carrier)——核心方法：**
+
+```java
+public void inject(ContextCarrier carrier) {
+    // 获取当前活跃的 ExitSpan
+    AbstractSpan span = activeSpan();  // 栈顶
+    if (!span.isExit()) {
+        throw new IllegalStateException("inject 只能在 ExitSpan 上执行");
+    }
+    ExitSpan exitSpan = (ExitSpan) span;
+    
+    // 把 TracingContext 中的关键信息写入 carrier
+    carrier.setTraceId(segment.getRelatedGlobalTraceId());   // traceId
+    carrier.setTraceSegmentId(segment.getTraceSegmentId());  // 当前 segmentId
+    carrier.setSpanId(exitSpan.getSpanId());                 // 当前 spanId
+    carrier.setParentService(Config.Agent.SERVICE_NAME);     // 服务名 "gateway"
+    carrier.setParentServiceInstance(Config.Agent.INSTANCE_NAME); // 实例名
+    carrier.setParentEndpoint(first().getOperationName());   // 入口端点名
+    carrier.setAddressUsedAtClient(exitSpan.getPeer());      // "order-service:8080"
+    
+    // 处理 correlation context（用户自定义透传字段）
+    carrier.getCorrelationContext().handle(span.getCorrelationContext());
+    
+    // 处理扩展字段
+    carrier.getExtensionContext().handle(span.getExtensionContext());
+}
+```
+
+**carrier 序列化为 sw8 Header：**
+
+```java
+// ContextCarrier 序列化格式 (sw8 协议 v3)
+// 格式：1-TRACE_ID-SEGMENT_ID-SPAN_ID-SERVICE-INSTANCE-ENDPOINT-PEER
+// 各字段用 "-" 分隔，值经过 Base64 编码
+
+String sw8Value = carrier.serialize(HeaderVersion.v3);
+// 示例值："1-dHJhY2VJZA==-c2VnbWVudElk-1-Z2F0ZXdheQ==-aW5zdGFuY2U=-L2FwaS9vcmRlci9jcmVhdGU=-b3JkZXItc2VydmljZTo4MDgw"
+
+// 第一个字段 "1" 表示采样标记（1=采样，0=不采样）
+// 后面每个字段都是 Base64(原始值)
+
+// 这个值被设置到 HTTP 请求的 Header 中：
+httpRequest.setHeader("sw8", sw8Value);
+// 如果有 correlation context，还会设置 "sw8-correlation" Header
+```
+
+**此时 Gateway 的数据结构状态：**
+
+```
+ThreadLocal<TracingContext>:
+  TracingContext-Gateway:
+    segment:
+      traceSegmentId: "seg-gateway-001"
+      traceId: "trace-001"  (贯穿全链路的 ID)
+    activeSpanStack: [
+      EntrySpan(id=0, op="/api/order/create"),  ← 栈底
+      ExitSpan(id=1, op="/api/order/create", peer="order-service:8080")  ← 栈顶
+    ]
+    spanIdGenerator: 2
+    
+HTTP 请求出去时携带：
+  Header "sw8": "1-<trace-001的Base64>-<seg-gateway-001的Base64>-1-<gateway的Base64>-..."
+```
+
+#### Gateway afterMethod（请求返回后）
+
+```java
+// 收到 OrderService 响应后
+ContextManager.stopSpan();  // 停止 ExitSpan
+
+// TracingContext.stopSpan() 内部：
+public boolean stopSpan(AbstractSpan span) {
+    AbstractSpan lastSpan = peek();  // 取栈顶
+    if (lastSpan == span) {
+        // 是栈顶，可以结束
+        if (span.finish(segment)) {  
+            // finish() 设置 endTime，归档到 segment.spans 列表
+            pop();  // 从 activeSpanStack 弹出
+        }
+    }
+    
+    // 检查是否所有 Span 都结束了
+    if (activeSpanStack.isEmpty()) {
+        // 整个 Segment 完成！
+        this.finish();  // 触发上报
+        return true;
+    }
+    return false;
+}
+```
+
+最终 Gateway 的 EntrySpan 也结束后，`activeSpanStack` 为空，触发 Segment 上报：
+
+```java
+// TracingContext.finish()
+private void finish() {
+    // 通知所有监听器
+    TracingContext.ListenerManager.notifyFinish(segment);
+    // ↓ 其中 TraceSegmentServiceClient 会把 segment 放入发送队列
+    // ↓ 后台线程通过 gRPC 发送给 OAP Collector
+    
+    // 清理 ThreadLocal
+    ContextManager.CONTEXT.remove();
+}
+```
+
+**Gateway Segment-1 最终内容：**
+
+```
+Segment-1 (Gateway):
+  traceId: "trace-001"
+  segmentId: "seg-gateway-001"
+  service: "gateway"
+  spans:
+    - EntrySpan: id=0, parentId=-1, op="/api/order/create", component=SpringCloudGateway
+    - ExitSpan:  id=1, parentId=0,  op="/api/order/create", peer="order-service:8080"
+  refs: []  (没有上游，这是链路起点)
+```
+
+---
+
+### 9.3 第二步：请求到达 OrderService
+
+#### 外部视角
+
+Gateway 的 HTTP 请求带着 `sw8` Header 到达 OrderService 的 Tomcat 容器。
+
+#### 插件与拦截器
+
+```
+插件定义文件：tomcat-7.x-8.x-plugin / skywalking-plugin.def
+增强类：org.apache.catalina.core.StandardHostValve
+拦截方法：invoke(Request, Response)
+拦截器：TomcatInvokeInterceptor
+```
+
+#### 源码执行详解
+
+**TomcatInvokeInterceptor.beforeMethod()：**
+
+```java
+public void beforeMethod(EnhancedInstance objInst, Method method,
+                         Object[] allArguments, ...) {
+    
+    HttpServletRequest request = (HttpServletRequest) allArguments[0];
+    
+    // ===== 第一步：从 HTTP Header 反序列化 ContextCarrier =====
+    ContextCarrier contextCarrier = new ContextCarrier();
+    CarrierItem next = contextCarrier.items();
+    while (next.hasNext()) {
+        next = next.next();
+        String headerKey = next.getHeadKey();    // "sw8" 或 "sw8-correlation"
+        String headerValue = request.getHeader(headerKey);
+        // headerValue = "1-dHJhY2VJZA==-c2VnbWVudElk-1-Z2F0ZXdheQ==-..."
+        next.setHeadValue(headerValue);
+        // ↓ 内部会调用 carrier.deserialize(headerValue)
+        // ↓ 解析出 traceId、segmentId、spanId、parentService 等
+    }
+    // 此时 contextCarrier.isValid() == true
+    
+    // ===== 第二步：创建 EntrySpan（带 carrier） =====
+    String operationName = request.getMethod() + ":" + request.getRequestURI();
+    // operationName = "POST:/api/order/create"
+    
+    AbstractSpan span = ContextManager.createEntrySpan(operationName, contextCarrier);
+    // ↓ 内部流程分解如下
+}
+```
+
+**ContextManager.createEntrySpan(op, carrier) 的关键路径（carrier 有效时）：**
+
+```java
+public static AbstractSpan createEntrySpan(String operationName, ContextCarrier carrier) {
+    AbstractTracerContext context = getOrCreate(operationName, false);
+    // 创建新的 TracingContext-OrderService
+    // 此时内部的 traceId 是新生成的（还没和 Gateway 关联）
+    
+    AbstractSpan span = context.createEntrySpan(operationName);
+    // 创建 EntrySpan，spanId=0
+    
+    // 关键！carrier 有效，执行 extract
+    context.extract(carrier);
+    return span;
+}
+```
+
+**TracingContext.extract(carrier)——链路关联的核心：**
+
+```java
+public void extract(ContextCarrier carrier) {
+    // 这个方法是 "下游连接上游" 的关键
+
+    // 1. 创建 TraceSegmentRef（父 Segment 引用）
+    TraceSegmentRef ref = new TraceSegmentRef(carrier);
+    // ref 内部存储了：
+    //   parentTraceSegmentId = carrier.getTraceSegmentId()  → Gateway 的 segmentId
+    //   parentSpanId = carrier.getSpanId()                  → Gateway 的 ExitSpan id (1)
+    //   parentService = carrier.getParentService()          → "gateway"
+    //   parentEndpoint = carrier.getParentEndpoint()        → "/api/order/create"
+    //   addressUsedAtClient = carrier.getAddressUsedAtClient() → "order-service:8080"
+    
+    // 2. 把 ref 添加到当前 Segment
+    this.segment.ref(ref);
+    // segment.refs.add(ref)
+    // 这个 ref 就是 Collector 还原调用链的关键数据
+    
+    // 3. 【最关键】用上游的 traceId 覆盖自己的 traceId
+    this.segment.relatedGlobalTraceId(carrier.getTraceId());
+    // 原来 OrderService 自己生成的 traceId 被丢弃
+    // 现在用的是 Gateway 传过来的 "trace-001"
+    // 这就是为什么整条链路的 traceId 都是同一个！
+    
+    // 4. 把 ref 也关联到当前 EntrySpan
+    AbstractSpan entrySpan = activeSpan();
+    entrySpan.ref(ref);
+    
+    // 5. 继承 correlation context（用户自定义透传字段）
+    this.correlationContext.extract(carrier);
+}
+```
+
+**设置 Span 信息：**
+
+```java
+// 回到 TomcatInvokeInterceptor.beforeMethod() 后续
+span.setComponent(ComponentsDefine.TOMCAT);  // component = "Tomcat"
+SpanLayer.asHttp(span);                       // layer = HTTP
+span.tag(Tags.URL, request.getRequestURL().toString());
+span.tag(Tags.HTTP_METHOD, request.getMethod());
+```
+
+**此时 OrderService 的数据结构状态：**
+
+```
+ThreadLocal<TracingContext>:
+  TracingContext-OrderService:
+    segment:
+      traceSegmentId: "seg-order-001"  (自己的 segmentId)
+      traceId: "trace-001"  (从 Gateway carrier 继承来的！)
+      refs: [TraceSegmentRef → seg-gateway-001, spanId=1]
+      spans: []
+    activeSpanStack: [EntrySpan(id=0, op="POST:/api/order/create")]
+    spanIdGenerator: 1
+```
+
+---
+
+### 9.4 第三步：OrderService 调用 InventoryService（HttpClient 插件）
+
+#### 外部视角
+
+OrderService 业务逻辑中使用 Apache HttpClient 同步调用 InventoryService 扣减库存：
+```java
+// 业务代码
+HttpGet request = new HttpGet("http://inventory-service:8080/api/inventory/deduct?sku=123");
+HttpResponse response = httpClient.execute(request);
+```
+
+#### 插件与拦截器
+
+```
+插件定义文件：httpClient-4.x-plugin / skywalking-plugin.def
+增强类：org.apache.http.impl.client.CloseableHttpClient (AbstractHttpClient)
+拦截方法：execute(HttpHost, HttpRequest, HttpContext)
+拦截器：HttpClientExecuteInterceptor
+```
+
+#### 源码执行详解
+
+**HttpClientExecuteInterceptor.beforeMethod()：**
+
+```java
+public void beforeMethod(EnhancedInstance objInst, Method method,
+                         Object[] allArguments, ...) {
+    
+    HttpRequest httpRequest = (HttpRequest) allArguments[1];
+    HttpHost httpHost = (HttpHost) allArguments[0];
+    
+    String remotePeer = httpHost.getHostName() + ":" + httpHost.getPort();
+    // remotePeer = "inventory-service:8080"
+    
+    String operationName = httpRequest.getRequestLine().getUri();
+    // operationName = "/api/inventory/deduct"
+    
+    // ===== 创建 ExitSpan + inject =====
+    ContextCarrier contextCarrier = new ContextCarrier();
+    AbstractSpan exitSpan = ContextManager.createExitSpan(
+        operationName, contextCarrier, remotePeer
+    );
+    
+    // ContextManager.createExitSpan 内部：
+    //   1. context.createExitSpan(op, peer) → 创建 ExitSpan(id=1, parentId=0)
+    //   2. context.inject(carrier) → 把 trace-001, seg-order-001, spanId=1 写入 carrier
+    
+    // ===== 将 carrier 写入 HTTP Header =====
+    exitSpan.setComponent(ComponentsDefine.HTTPCLIENT);
+    SpanLayer.asHttp(exitSpan);
+    
+    CarrierItem next = contextCarrier.items();
+    while (next.hasNext()) {
+        next = next.next();
+        httpRequest.setHeader(next.getHeadKey(), next.getHeadValue());
+        // 设置 Header "sw8": "1-<trace-001>-<seg-order-001>-1-<order-service>-..."
+        // 注意：这里 spanId=1 是 OrderService 的 ExitSpan id
+    }
+}
+```
+
+**inject 后 carrier 的内容：**
+
+```
+ContextCarrier 内容：
+  traceId: "trace-001"
+  segmentId: "seg-order-001"  (OrderService 的 segmentId)
+  spanId: 1  (OrderService 中 ExitSpan 的 id)
+  parentService: "order-service"
+  parentServiceInstance: "order-service-instance-001"
+  parentEndpoint: "POST:/api/order/create"  (EntrySpan 的 operationName)
+  addressUsedAtClient: "inventory-service:8080"
+  
+序列化为 sw8 Header:
+  "1-dHJhY2UtMDAx-c2VnLW9yZGVyLTAwMQ==-1-b3JkZXItc2VydmljZQ==-..."
+```
+
+**此时 OrderService 的 Span 栈：**
+
+```
+activeSpanStack: [
+  EntrySpan(id=0, op="POST:/api/order/create"),      ← 栈底
+  ExitSpan(id=1, op="/api/inventory/deduct", peer="inventory-service:8080")  ← 栈顶
+]
+```
+
+---
+
+### 9.5 第四步：InventoryService 接收请求并查询 MySQL
+
+#### 外部视角
+
+InventoryService 的 Tomcat 收到请求（带 sw8 Header），处理库存扣减逻辑，内部查询 MySQL。
+
+#### 9.5.1 Tomcat 入口（与第三步 OrderService 完全相同的模式）
+
+```
+拦截器：TomcatInvokeInterceptor
+流程：
+  1. 从 Header 取出 sw8 → 反序列化到 ContextCarrier
+  2. createEntrySpan("POST:/api/inventory/deduct", carrier)
+  3. extract(carrier)：
+     - 继承 traceId = "trace-001"
+     - 创建 SegmentRef 指向 seg-order-001, spanId=1
+```
+
+**InventoryService 的 TracingContext 状态：**
+
+```
+TracingContext-InventoryService:
+  segment:
+    traceSegmentId: "seg-inventory-001"
+    traceId: "trace-001"  (继承来的)
+    refs: [TraceSegmentRef → seg-order-001, spanId=1]
+  activeSpanStack: [EntrySpan(id=0, op="POST:/api/inventory/deduct")]
+  spanIdGenerator: 1
+```
+
+#### 9.5.2 MySQL/JDBC 插件（ExitSpan 但不 inject）
+
+**这是一个关键的设计差异点：不是所有 ExitSpan 都需要 inject！**
+
+```
+插件定义文件：mysql-8.x-plugin / skywalking-plugin.def
+增强类：com.mysql.cj.jdbc.ClientPreparedStatement
+拦截方法：execute(), executeQuery(), executeUpdate()
+拦截器：PreparedStatementExecuteMethodsInterceptor
+```
+
+**PreparedStatementExecuteMethodsInterceptor.beforeMethod()：**
+
+```java
+public void beforeMethod(EnhancedInstance objInst, Method method,
+                         Object[] allArguments, ...) {
+    
+    // 从增强实例中获取连接信息（在 Connection 创建时就存储了）
+    StatementEnhanceInfos enhanceInfos = 
+        (StatementEnhanceInfos) objInst.getSkyWalkingDynamicField();
+    ConnectionInfo connectInfo = enhanceInfos.getConnectionInfo();
+    
+    String remotePeer = connectInfo.getDatabasePeer();
+    // remotePeer = "mysql-host:3306"
+    
+    // ===== 注意：这里没有创建 ContextCarrier！ =====
+    // 直接创建 ExitSpan，不传 carrier
+    AbstractSpan span = ContextManager.createExitSpan(
+        buildOperationName(connectInfo, method.getName()),  // "MySQL/JDBI/PreparedStatement/executeQuery"
+        remotePeer
+    );
+    
+    // 不调用 inject！因为 MySQL 服务端没有 SkyWalking Agent
+    // 往 MySQL 的 TCP 协议里注入 sw8 毫无意义
+    
+    span.setComponent(ComponentsDefine.MYSQL);
+    SpanLayer.asDB(span);                    // SpanLayer = Database
+    span.tag(Tags.DB_TYPE, "MySQL");
+    span.tag(Tags.DB_INSTANCE, connectInfo.getDatabaseName());
+    span.tag(Tags.DB_STATEMENT, enhanceInfos.getStatementName());
+    // 记录 SQL 语句（可配置是否记录完整 SQL）
+}
+```
+
+**为什么 JDBC 不 inject？**
+
+```
+设计原则：inject 的目的是让下游 Agent 能 extract，从而关联到同一条 Trace。
+MySQL 服务器没有装 SkyWalking Agent，即使你把 sw8 信息注入了也没人读取。
+所以 JDBC 插件只创建 ExitSpan 记录"我调了 MySQL"，但不做 inject。
+ExitSpan 的 peer 字段记录了目标地址，Collector 仍然能画出 OrderService → MySQL 的拓扑。
+```
+
+**ContextManager.createExitSpan(op, peer)（无 carrier 版本）：**
+
+```java
+// 这是没有 carrier 参数的重载版本
+public static AbstractSpan createExitSpan(String operationName, String remotePeer) {
+    AbstractTracerContext context = getOrCreate(operationName, false);
+    // 直接创建 ExitSpan，不调用 inject
+    return context.createExitSpan(operationName, remotePeer);
+}
+```
+
+**afterMethod：**
+
+```java
+public Object afterMethod(EnhancedInstance objInst, Method method,
+                          Object[] allArguments, Class<?>[] argumentsTypes,
+                          Object ret) {
+    ContextManager.stopSpan();  // 结束 MySQL ExitSpan
+    return ret;
+}
+```
+
+**InventoryService 的 Span 栈变化：**
+
+```
+MySQL 查询前：
+  activeSpanStack: [
+    EntrySpan(id=0, op="POST:/api/inventory/deduct"),
+    ExitSpan(id=1, op="MySQL/JDBI/.../executeQuery", peer="mysql:3306")
+  ]
+
+MySQL 查询后（stopSpan）：
+  activeSpanStack: [
+    EntrySpan(id=0, op="POST:/api/inventory/deduct")
+  ]
+  segment.spans: [ExitSpan(id=1)]  ← 已归档
+```
+
+#### 9.5.3 InventoryService 返回响应
+
+请求处理完毕，Tomcat 的 afterMethod 被调用：
+
+```java
+// TomcatInvokeInterceptor.afterMethod()
+ContextManager.stopSpan();  // 停止 EntrySpan
+// activeSpanStack 为空 → Segment 完成 → 触发上报
+```
+
+**InventoryService Segment-3 最终内容：**
+
+```
+Segment-3 (InventoryService):
+  traceId: "trace-001"
+  segmentId: "seg-inventory-001"
+  service: "inventory-service"
+  spans:
+    - EntrySpan: id=0, parentId=-1, op="POST:/api/inventory/deduct", component=Tomcat, layer=HTTP
+    - ExitSpan:  id=1, parentId=0,  op="MySQL/JDBI/.../executeQuery", peer="mysql:3306", component=MySQL, layer=DB
+  refs: [TraceSegmentRef(parentSegment=seg-order-001, parentSpan=1, parentService=order-service)]
+```
+
+---
+
+### 9.6 第五步：OrderService 发送 RocketMQ 消息（跨进程异步传播）
+
+#### 外部视角
+
+OrderService 收到 InventoryService 的成功响应后，将订单信息发送到 RocketMQ 的 `order-payment-topic`，让 PaymentService 异步处理支付。
+
+```java
+// 业务代码
+Message msg = new Message("order-payment-topic", "TagA", orderJson.getBytes());
+SendResult result = producer.send(msg);
+```
+
+#### 插件与拦截器
+
+```
+插件定义文件：rocketMQ-4.x-plugin / skywalking-plugin.def
+增强类：org.apache.rocketmq.client.impl.MQClientAPIImpl
+拦截方法：sendMessage(...)
+拦截器：MessageSendInterceptor
+
+另外还增强了 Message 类本身：
+增强类：org.apache.rocketmq.common.message.Message
+目的：给 Message 对象增加 EnhancedInstance 接口，可以存储 skywalking 动态字段
+```
+
+#### 源码执行详解
+
+**MessageSendInterceptor.beforeMethod()：**
+
+```java
+public void beforeMethod(EnhancedInstance objInst, Method method,
+                         Object[] allArguments, ...) {
+    
+    Message message = (Message) allArguments[2];
+    String topicName = message.getTopic();  // "order-payment-topic"
+    
+    // ===== 创建 ExitSpan =====
+    ContextCarrier contextCarrier = new ContextCarrier();
+    String nameSrvAddr = String.valueOf(objInst.getSkyWalkingDynamicField());
+    
+    AbstractSpan exitSpan = ContextManager.createExitSpan(
+        "RocketMQ/Producer/order-payment-topic/Producer",  // operationName
+        contextCarrier,
+        nameSrvAddr  // peer = "mq-broker:10911"
+    );
+    
+    exitSpan.setComponent(ComponentsDefine.ROCKET_MQ_PRODUCER);
+    SpanLayer.asMQ(exitSpan);  // layer = MQ
+    exitSpan.tag(Tags.MQ_TOPIC, topicName);
+    
+    // ===== 关键区别：MQ 的 inject 不是写 HTTP Header，而是写消息属性 =====
+    // RocketMQ 的 carrier 需要写入 Message 的 properties 中
+    CarrierItem next = contextCarrier.items();
+    while (next.hasNext()) {
+        next = next.next();
+        // 写入 Message 的 UserProperty
+        message.putUserProperty(next.getHeadKey(), next.getHeadValue());
+        // key = "sw8", value = "1-<trace-001>-<seg-order-001>-2-..."
+        // 注意 spanId=2，因为 OrderService 此时已经有了：
+        //   id=0 EntrySpan, id=1 ExitSpan(HTTP调InventoryService已结束), id=2 当前ExitSpan(MQ)
+    }
+    
+    // 设置消息的 Keys 便于追踪
+    // message.setKeys(traceId) 可选
+}
+```
+
+**注意这里的 spanId 计数：**
+
+```
+OrderService 此时的 spanIdGenerator 情况：
+  id=0: EntrySpan (Tomcat入口)
+  id=1: ExitSpan (调 InventoryService，已结束)  ← 已经 finish 并归档了
+  id=2: ExitSpan (发 RocketMQ)  ← 当前活跃
+
+activeSpanStack: [
+  EntrySpan(id=0),
+  ExitSpan(id=2, op="RocketMQ/Producer/.../Producer", peer="mq-broker:10911")
+]
+注意 id=1 的 ExitSpan 已经结束弹出栈了，但 spanIdGenerator 是递增的不会重用
+```
+
+**afterMethod（消息发送成功后）：**
+
+```java
+public Object afterMethod(EnhancedInstance objInst, Method method,
+                          Object[] allArguments, Class<?>[] argumentsTypes,
+                          Object ret) {
+    SendResult sendResult = (SendResult) ret;
+    
+    AbstractSpan activeSpan = ContextManager.activeSpan();
+    if (sendResult != null) {
+        // 记录消息 ID
+        activeSpan.tag(Tags.MQ_MESSAGE_ID, sendResult.getMsgId());
+        
+        if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
+            activeSpan.errorOccurred();  // 发送失败标记错误
+        }
+    }
+    
+    ContextManager.stopSpan();  // 结束 MQ ExitSpan
+    return ret;
+}
+```
+
+**跨进程数据传递（MQ 场景 vs HTTP 场景的对比）：**
+
+```
+HTTP 场景：
+  载体 = HTTP Header
+  key = "sw8"
+  在哪设置 = httpRequest.setHeader("sw8", carrier.serialize())
+  在哪提取 = request.getHeader("sw8")
+
+MQ 场景：
+  载体 = 消息的 UserProperty / 消息属性
+  key = "sw8"
+  在哪设置 = message.putUserProperty("sw8", carrier.serialize())
+  在哪提取 = msg.getUserProperty("sw8")
+
+设计本质相同：找一个能从"发送方"传递到"接收方"的键值对容器，
+把 sw8 字符串塞进去即可。SkyWalking 对此做了抽象——CarrierItem 迭代器模式。
+```
+
+---
+
+### 9.7 第六步：OrderService 提交异步任务（跨线程传播）
+
+#### 外部视角
+
+OrderService 在发完 MQ 消息后，将"通知用户"的任务提交到线程池异步执行：
+
+```java
+// 业务代码
+executorService.submit(new NotifyUserTask(orderId, userId));
+```
+
+#### 插件与拦截器
+
+SkyWalking 有两种方式处理跨线程：
+
+**方式一：@TraceCrossThread 注解 + 工具类（需业务代码侵入）**
+
+```java
+// 业务代码中使用 SkyWalking 提供的工具类
+executorService.submit(CallableWrapper.of(new NotifyCallable(orderId)));
+// 或者使用注解
+@TraceCrossThread
+public class NotifyUserTask implements Runnable { ... }
+```
+
+**方式二：线程池插件自动增强（无侵入，推荐）**
+
+```
+插件定义文件：jdk-threadpool-plugin (可选插件)
+增强类：java.lang.Runnable / java.util.concurrent.Callable
+机制：在 submit 时自动 capture，在 run/call 时自动 continued
+```
+
+这里以**方式一**的原理来详细解释（方式二的自动增强只是自动化了这个过程）：
+
+#### 源码执行详解
+
+**主线程：capture() 捕获快照**
+
+```java
+// CallableWrapper / RunnableWrapper 的构造过程
+// 在主线程执行（submit 的调用线程）
+
+public class RunnableWrapper implements Runnable {
+    private Runnable delegate;
+    private ContextSnapshot snapshot;
+    
+    private RunnableWrapper(Runnable delegate) {
+        this.delegate = delegate;
+        // ===== 关键：在主线程中捕获当前上下文快照 =====
+        this.snapshot = ContextManager.capture();
+    }
+}
+```
+
+**ContextManager.capture()：**
+
+```java
+public static ContextSnapshot capture() {
+    AbstractTracerContext context = CONTEXT.get();  // 主线程的 TracingContext
+    if (context == null) {
+        return null;
+    }
+    return context.capture();
+}
+```
+
+**TracingContext.capture()：**
+
+```java
+public ContextSnapshot capture() {
+    ContextSnapshot snapshot = new ContextSnapshot(
+        segment.getRelatedGlobalTraceId(),   // traceId = "trace-001"
+        segment.getTraceSegmentId(),          // segmentId = "seg-order-001"
+        activeSpan().getSpanId(),             // 当前活跃 Span 的 id（此时是 EntrySpan, id=0）
+        segment.getCorrelationContext(),      // correlation context
+        segment.getExtensionContext()         // extension context
+    );
+    return snapshot;
+    
+    // 注意：ContextSnapshot 和 ContextCarrier 的字段几乎完全相同
+    // 区别在于：
+    //   - Snapshot 不需要 serialize/deserialize（内存直接传引用）
+    //   - Snapshot 不需要 parentService/parentInstance 等字段（同一个 JVM 内）
+    //   - Snapshot 的 parentEndpoint 直接用 operationName（不需要 Base64）
+}
+```
+
+**ContextSnapshot 的内部结构：**
+
+```java
+public class ContextSnapshot {
+    private DistributedTraceId traceId;         // "trace-001"
+    private String traceSegmentId;              // "seg-order-001"
+    private int spanId;                         // 0 (主线程当前活跃 Span 的 id)
+    private String parentEndpoint;             // "POST:/api/order/create"
+    private CorrelationContext correlationContext;
+    private ExtensionContext extensionContext;
+    
+    // 注意：没有 parentService/parentInstance！
+    // 因为是同一个进程内的线程，这些信息不需要跨进程携带
+}
+```
+
+**子线程：continued() 恢复上下文**
+
+```java
+// RunnableWrapper.run() 在子线程中执行
+public void run() {
+    // ===== 恢复上下文 =====
+    if (snapshot != null) {
+        ContextManager.continued(snapshot);
+    }
+    try {
+        delegate.run();  // 执行真正的业务逻辑
+    } finally {
+        ContextManager.stopSpan();  // 结束子线程的 LocalSpan
+        // 子线程的 Segment 完成上报
+    }
+}
+```
+
+**ContextManager.continued(snapshot)：**
+
+```java
+public static void continued(ContextSnapshot snapshot) {
+    if (snapshot == null || !snapshot.isValid()) {
+        return;
+    }
+    // 在子线程中创建一个 LocalSpan 作为子线程的根 Span
+    AbstractSpan span = createLocalSpan(snapshot.getParentEndpoint() + "/Thread");
+    // operationName = "POST:/api/order/create/Thread"
+    
+    // 获取子线程的 TracingContext（刚在 createLocalSpan 中创建的）
+    AbstractTracerContext context = CONTEXT.get();
+    context.continued(snapshot);
+}
+```
+
+**TracingContext.continued(snapshot)：**
+
+```java
+public void continued(ContextSnapshot snapshot) {
+    // 和 extract(carrier) 非常相似！
+    
+    // 1. 创建 SegmentRef
+    TraceSegmentRef segmentRef = new TraceSegmentRef(snapshot);
+    // ref 指向主线程的 Segment
+    //   parentTraceSegmentId = "seg-order-001"
+    //   parentSpanId = 0
+    //   parentEndpoint = "POST:/api/order/create"
+    
+    // 2. 添加到当前 Segment
+    this.segment.ref(segmentRef);
+    
+    // 3. 【关键】用主线程的 traceId 覆盖子线程的 traceId
+    this.segment.relatedGlobalTraceId(snapshot.getTraceId());
+    // 子线程的 traceId 也变成 "trace-001"
+    
+    // 4. 关联到当前 Span
+    activeSpan().ref(segmentRef);
+    
+    // 5. 继承 correlation context
+    this.correlationContext.continued(snapshot);
+}
+```
+
+**子线程的 TracingContext 状态：**
+
+```
+TracingContext-AsyncThread:
+  segment:
+    traceSegmentId: "seg-order-async-001"  (子线程自己的 segmentId)
+    traceId: "trace-001"  (从主线程 snapshot 继承)
+    refs: [TraceSegmentRef → seg-order-001, spanId=0]
+  activeSpanStack: [LocalSpan(id=0, op="POST:/api/order/create/Thread")]
+  spanIdGenerator: 1
+```
+
+**子线程业务执行和结束：**
+
+```java
+// delegate.run() 中可能还有其他 Span
+// 比如发送 HTTP 请求通知用户
+// 那就会在 LocalSpan 下面再创建 ExitSpan
+
+// 最终 RunnableWrapper 的 finally 中：
+ContextManager.stopSpan();
+// 结束 LocalSpan → activeSpanStack 为空 → Segment 完成上报
+```
+
+**OrderService 异步线程 Segment-4 最终内容：**
+
+```
+Segment-4 (OrderService 异步线程):
+  traceId: "trace-001"
+  segmentId: "seg-order-async-001"
+  service: "order-service"
+  spans:
+    - LocalSpan: id=0, parentId=-1, op="POST:/api/order/create/Thread"
+  refs: [TraceSegmentRef(parentSegment=seg-order-001, parentSpan=0)]
+  
+注意：这里的 parentSpan=0 指向的是主线程的 EntrySpan
+（因为 capture 时主线程的活跃 Span 是 EntrySpan）
+```
+
+---
+
+### 9.8 第七步：PaymentService 消费 RocketMQ 消息
+
+#### 外部视角
+
+PaymentService 作为 RocketMQ 消费者，拉取到 `order-payment-topic` 的消息并处理支付逻辑。
+
+#### 插件与拦截器
+
+```
+插件定义文件：rocketMQ-4.x-plugin / skywalking-plugin.def
+增强类：org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently
+       或 MessageListenerOrderly
+拦截方法：consumeMessage(List<MessageExt>, ConsumeConcurrentlyContext)
+拦截器：MessageConsumeInterceptor
+```
+
+#### 源码执行详解
+
+**MessageConsumeInterceptor.beforeMethod()：**
+
+```java
+public void beforeMethod(EnhancedInstance objInst, Method method,
+                         Object[] allArguments, ...) {
+    
+    List<MessageExt> msgs = (List<MessageExt>) allArguments[0];
+    
+    // RocketMQ 可能批量消费多条消息，取第一条的上下文
+    MessageExt msg = msgs.get(0);
+    
+    // ===== 从消息属性中提取 sw8 =====
+    ContextCarrier contextCarrier = new ContextCarrier();
+    CarrierItem next = contextCarrier.items();
+    while (next.hasNext()) {
+        next = next.next();
+        // 从 Message 的 UserProperty 中取出 sw8
+        next.setHeadValue(msg.getUserProperty(next.getHeadKey()));
+        // key="sw8", value="1-<trace-001>-<seg-order-001>-2-..."
+        // 注意 spanId=2，对应 OrderService 中发 MQ 的那个 ExitSpan
+    }
+    
+    // ===== 创建 EntrySpan =====
+    AbstractSpan span = ContextManager.createEntrySpan(
+        "RocketMQ/Consumer/order-payment-topic/Consumer",  // operationName
+        contextCarrier
+    );
+    // 内部执行 extract(carrier)：
+    //   - traceId 变成 "trace-001"
+    //   - SegmentRef 指向 seg-order-001, spanId=2
+    
+    span.setComponent(ComponentsDefine.ROCKET_MQ_CONSUMER);
+    SpanLayer.asMQ(span);
+    span.tag(Tags.MQ_TOPIC, msg.getTopic());
+    span.tag(Tags.MQ_MESSAGE_ID, msg.getMsgId());
+}
+```
+
+**PaymentService 内部处理（可能还有数据库操作等）：**
+
+```java
+// 业务逻辑处理支付
+// 如果有 MySQL 操作，会像 InventoryService 一样创建 JDBC ExitSpan（不 inject）
+// 如果有 Redis 操作，也是 ExitSpan（不 inject，因为 Redis 没 Agent）
+```
+
+**afterMethod：**
+
+```java
+public Object afterMethod(EnhancedInstance objInst, Method method,
+                          Object[] allArguments, Class<?>[] argumentsTypes,
+                          Object ret) {
+    ContextManager.stopSpan();
+    // EntrySpan 结束 → Segment 完成上报
+    return ret;
+}
+```
+
+**PaymentService Segment-5 最终内容：**
+
+```
+Segment-5 (PaymentService):
+  traceId: "trace-001"
+  segmentId: "seg-payment-001"
+  service: "payment-service"
+  spans:
+    - EntrySpan: id=0, parentId=-1, op="RocketMQ/Consumer/order-payment-topic/Consumer", 
+                 component=RocketMQ, layer=MQ
+  refs: [TraceSegmentRef(parentSegment=seg-order-001, parentSpan=2, parentService=order-service)]
+  
+注意 parentSpan=2，对应 OrderService 中 RocketMQ Producer 的 ExitSpan
+```
+
+---
+
+### 9.9 第八步：OrderService 主线程完成
+
+#### 外部视角
+
+OrderService 主线程完成所有同步操作后，Tomcat 的 afterMethod 被触发。
+
+#### 源码执行
+
+```java
+// TomcatInvokeInterceptor.afterMethod()
+
+HttpServletResponse response = (HttpServletResponse) allArguments[1];
+AbstractSpan span = ContextManager.activeSpan();  // EntrySpan(id=0)
+
+span.tag(Tags.HTTP_RESPONSE_STATUS_CODE, String.valueOf(response.getStatus()));
+if (response.getStatus() >= 400) {
+    span.errorOccurred();
+}
+
+ContextManager.stopSpan();
+// stopSpan() → TracingContext.stopSpan(entrySpan)
+//   entrySpan.finish(segment)  → endTime = currentTimeMillis(), 归档到 segment.spans
+//   pop() → activeSpanStack 为空
+//   finish() → 触发 Segment 上报 → 清理 ThreadLocal
+```
+
+**OrderService 主线程 Segment-2 最终内容：**
+
+```
+Segment-2 (OrderService 主线程):
+  traceId: "trace-001"
+  segmentId: "seg-order-001"
+  service: "order-service"
+  spans:
+    - EntrySpan: id=0, parentId=-1, op="POST:/api/order/create", component=Tomcat, layer=HTTP
+    - ExitSpan:  id=1, parentId=0,  op="/api/inventory/deduct", peer="inventory-service:8080", 
+                 component=HttpClient, layer=HTTP
+    - ExitSpan:  id=2, parentId=0,  op="RocketMQ/Producer/order-payment-topic/Producer", 
+                 peer="mq-broker:10911", component=RocketMQ, layer=MQ
+  refs: [TraceSegmentRef(parentSegment=seg-gateway-001, parentSpan=1, parentService=gateway)]
+  
+注意：
+  - id=1 和 id=2 的 parentId 都是 0（都是 EntrySpan 的直接子 Span）
+  - spans 列表中的顺序是按照 finish 的时间排的（先结束的先入列表）
+  - 异步线程的 Span 不在这个 Segment 里！它有自己的 Segment-4
+```
+
+---
+
+### 9.10 Collector 端的链路还原
+
+所有 5 个 Segment 异步上报到 OAP Collector 后，Collector 如何还原完整调用链？
+
+#### 还原算法
+
+```
+输入：5 个 Segment，它们的 traceId 都是 "trace-001"
+
+步骤1：按 traceId 聚合
+  → 找到 traceId="trace-001" 的所有 Segment
+
+步骤2：找到根 Segment（没有 refs 的 Segment）
+  → Segment-1 (Gateway) 的 refs 为空 → 它是根
+
+步骤3：通过 SegmentRef 建立父子关系
+  Segment-2 的 ref 指向 (seg-gateway-001, spanId=1) 
+    → Segment-2 是 Segment-1 中 spanId=1 的 ExitSpan 调出来的
+  
+  Segment-3 的 ref 指向 (seg-order-001, spanId=1)
+    → Segment-3 是 Segment-2 中 spanId=1 的 ExitSpan 调出来的
+  
+  Segment-4 的 ref 指向 (seg-order-001, spanId=0)
+    → Segment-4 是 Segment-2 中 spanId=0 的 Span 派生的（跨线程）
+  
+  Segment-5 的 ref 指向 (seg-order-001, spanId=2)
+    → Segment-5 是 Segment-2 中 spanId=2 的 ExitSpan 调出来的
+
+步骤4：还原完整调用树
+```
+
+**最终的调用树结构：**
+
+```
+Trace: trace-001
+│
+├── [Segment-1] Gateway
+│   ├── EntrySpan: POST:/api/order/create
+│   └── ExitSpan: /api/order/create → order-service:8080
+│       │
+│       └── [Segment-2] OrderService (主线程)
+│           ├── EntrySpan: POST:/api/order/create
+│           ├── ExitSpan: /api/inventory/deduct → inventory-service:8080
+│           │   │
+│           │   └── [Segment-3] InventoryService
+│           │       ├── EntrySpan: POST:/api/inventory/deduct
+│           │       └── ExitSpan: MySQL/executeQuery → mysql:3306
+│           │
+│           ├── ExitSpan: RocketMQ/Producer → mq-broker:10911
+│           │   │
+│           │   └── [Segment-5] PaymentService (MQ Consumer)
+│           │       └── EntrySpan: RocketMQ/Consumer/order-payment-topic
+│           │
+│           └── (跨线程派生)
+│               │
+│               └── [Segment-4] OrderService (异步线程)
+│                   └── LocalSpan: POST:/api/order/create/Thread
+```
+
+---
+
+### 9.11 核心设计模式总结
+
+通过这个完整流程，可以清晰看到 SkyWalking 中的所有核心设计模式：
+
+#### 9.11.1 插件发现与字节码增强
+
+```
+启动阶段：
+  premain() → PluginBootstrap.loadPlugins() → 扫描所有 jar 中的 skywalking-plugin.def
+           → PluginFinder 建立 {类名 → 插件} 映射
+           → ByteBuddy.type(pluginFinder.buildMatch()).transform(...)
+           → JVM 加载目标类时自动织入拦截逻辑
+
+运行阶段（以 Tomcat 为例）：
+  StandardHostValve.invoke() 被调用
+  → ByteBuddy 织入的代码先执行 TomcatInvokeInterceptor.beforeMethod()
+  → 原始方法执行
+  → TomcatInvokeInterceptor.afterMethod()
+  → 如有异常：TomcatInvokeInterceptor.handleMethodException()
+```
+
+#### 9.11.2 三种 Span 类型的使用场景
+
+```
+EntrySpan（入口 Span）：
+  - 谁创建：服务端插件（Tomcat、Spring MVC、MQ Consumer、gRPC Server...）
+  - 何时创建：接收到外部请求时
+  - 特点：同一个入口可能多个拦截器触发（Tomcat + Spring MVC），通过复用机制合并
+  - 一个 Segment 通常只有一个 EntrySpan
+  
+ExitSpan（出口 Span）：
+  - 谁创建：客户端插件（HttpClient、JDBC、Redis、MQ Producer、Dubbo Consumer...）
+  - 何时创建：发起对外调用时
+  - 分两种：需要 inject 的（下游有 Agent）和 不需要 inject 的（下游没 Agent）
+  - 一个 Segment 可以有多个 ExitSpan
+  
+LocalSpan（本地 Span）：
+  - 谁创建：跨线程 continued 机制、或用户手动 @Trace 注解
+  - 何时创建：需要追踪本地方法但不涉及网络调用时
+  - 特点：既不是入口也不是出口，用于记录重要的本地操作
+```
+
+#### 9.11.3 Span 栈与复用机制
+
+```
+Span 栈规则：
+  - push：创建 Span 时压栈
+  - pop：Span finish 时弹栈
+  - peek：获取栈顶（当前活跃 Span）
+  - 嵌套关系通过栈的顺序体现
+
+EntrySpan 复用（重要优化）：
+  场景：Tomcat 创建 EntrySpan → Spring MVC 又要创建 EntrySpan
+  处理：检测到栈顶已是 EntrySpan → 不创建新的，只更新 operationName
+  效果：最终 operationName 是最内层的（Spring MVC 的更精确）
+
+ExitSpan 复用：
+  场景：HttpClient 创建 ExitSpan → 内部 Socket 层又要创建 ExitSpan
+  处理：检测到栈顶已是 ExitSpan → 不创建新的，保持原样
+  效果：避免一次出口调用产生多个冗余 ExitSpan
+```
+
+#### 9.11.4 上下文传播的统一抽象
+
+```
+CarrierItem 迭代器模式：
+
+不管是 HTTP、MQ、RPC 还是其他协议，SkyWalking 都用相同的模式处理：
+
+// 发送端（inject 后写入载体）：
+CarrierItem next = carrier.items();
+while (next.hasNext()) {
+    next = next.next();
+    载体.set(next.getHeadKey(), next.getHeadValue());
+    // HTTP: request.setHeader(key, value)
+    // MQ: message.putUserProperty(key, value)
+    // RPC: invocation.setAttachment(key, value)
+}
+
+// 接收端（从载体中提取）：
+CarrierItem next = carrier.items();
+while (next.hasNext()) {
+    next = next.next();
+    next.setHeadValue(载体.get(next.getHeadKey()));
+    // HTTP: request.getHeader(key)
+    // MQ: msg.getUserProperty(key)
+    // RPC: invocation.getAttachment(key)
+}
+
+好处：新增传播协议只需实现"set/get 键值对"，核心逻辑完全复用
+```
+
+#### 9.11.5 sw8 协议格式详解
+
+```
+格式：{sample}-{traceId}-{segmentId}-{spanId}-{service}-{instance}-{endpoint}-{peer}
+
+各字段含义：
+  sample:    采样标记，1=采样/0=不采样
+  traceId:   Base64(全局唯一 TraceId)
+  segmentId: Base64(发送方的 SegmentId)
+  spanId:    发送方当前 ExitSpan 的 spanId（数字，不编码）
+  service:   Base64(发送方服务名)
+  instance:  Base64(发送方实例名)
+  endpoint:  Base64(发送方入口端点 operationName)
+  peer:      Base64(接收方地址，即 ExitSpan.peer)
+
+实际示例：
+  "1-dHJhY2UtMDAx-c2VnLW9yZGVyLTAwMQ==-2-b3JkZXItc2VydmljZQ==-b3JkZXItaW5zdGFuY2U=-UE9TVDovYXBpL29yZGVy-bXEtYnJva2VyOjEwOTEx"
+  
+  解码：
+  sample=1, traceId="trace-001", segmentId="seg-order-001", spanId=2,
+  service="order-service", instance="order-instance", 
+  endpoint="POST:/api/order", peer="mq-broker:10911"
+```
+
+#### 9.11.6 Segment 生命周期
+
+```
+创建时机：
+  线程中第一次调用 ContextManager.createXxxSpan() 时
+  → getOrCreate() 发现 ThreadLocal 为空
+  → 创建 TracingContext（内部创建 TraceSegment）
+  → 绑定 ThreadLocal
+
+存活期间：
+  该线程持续创建/结束 Span
+  所有 finish 的 Span 归档到 segment.spans 列表
+  activeSpanStack 管理当前活跃的 Span
+
+完成时机：
+  最后一个 Span 被 stopSpan()
+  → activeSpanStack 为空
+  → TracingContext.finish() 被调用
+  → 通知 TraceSegmentServiceClient（放入发送队列）
+  → ContextManager.CONTEXT.remove()（清理 ThreadLocal）
+
+上报：
+  TraceSegmentServiceClient 后台线程
+  → 从队列取出 Segment
+  → 序列化为 Protobuf 格式
+  → 通过 gRPC 发送给 OAP Collector
+  
+一个关键认识：
+  Segment 不是按"请求"产生的，而是按"有 Agent 运行的线程"产生的。
+  一个请求经过 N 个有 Agent 的服务/线程，就产生 N 个 Segment。
+  没有 Agent 的节点（如 MySQL、Redis）不产生 Segment。
+```
+
+#### 9.11.7 ThreadLocal 隐式传播 vs 显式传参
+
+```
+SkyWalking 选择 ThreadLocal 隐式传播的原因：
+
+如果用显式传参：
+  void handleOrder(Request req, TracingContext ctx) {
+      inventoryClient.deduct(sku, ctx);  // 每个方法都要传 ctx
+      mqProducer.send(msg, ctx);
+      executorService.submit(() -> notify(userId, ctx));
+  }
+  
+  问题：
+  - 所有方法签名都要加 ctx 参数
+  - 第三方库无法修改（HttpClient、JDBC Driver 的方法签名不可能改）
+  - 业务代码严重侵入
+
+SkyWalking 的 ThreadLocal 方案：
+  void handleOrder(Request req) {
+      // TracingContext 在 ThreadLocal 中，拦截器自动获取
+      inventoryClient.deduct(sku);    // HttpClient 插件自动 inject
+      mqProducer.send(msg);           // RocketMQ 插件自动 inject
+      executorService.submit(task);   // 线程池插件自动 capture/continued
+  }
+  
+  优势：
+  - 业务代码零侵入
+  - 第三方库通过字节码增强拦截
+  - ContextManager.activeSpan() 在任何位置都能拿到当前 Span
+  
+  代价：
+  - 跨线程需要额外处理（ThreadLocal 不能跨线程）
+  - 异步框架（Reactor、CompletableFuture）需要专门的插件支持
+```
+
+#### 9.11.8 采样决策与 IgnoredTracerContext
+
+```
+采样发生在哪？
+
+// ContextManager.getOrCreate()
+if (SAMPLING_SERVICE.trySampling(operationName)) {
+    context = new TracingContext(operationName);  // 真正追踪
+} else {
+    context = new IgnoredTracerContext();         // 空实现，不追踪
+}
+
+IgnoredTracerContext 的设计：
+  - 实现了 AbstractTracerContext 接口
+  - 所有方法都是空操作（createSpan 返回 NoopSpan，inject/extract 不做事）
+  - 目的：即使不采样，插件代码的调用流程不变（不需要 if-else 判断）
+  - 这是经典的"空对象模式"(Null Object Pattern)
+
+采样传播规则：
+  - 如果上游已采样（sw8 第一位是 "1"），下游必须采样（尊重上游决策）
+  - 如果上游不采样（sw8 第一位是 "0"），下游也不采样
+  - 只有链路起点才做采样决策，后续节点只是跟随
+```
+
+---
+
+### 9.12 全链路数据流总览图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                              Trace: trace-001 全链路数据流                                 │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  用户浏览器                                                                               │
+│       │ POST /api/order/create                                                           │
+│       │ (无 sw8 Header)                                                                  │
+│       ▼                                                                                  │
+│  ┌─────────────────────────────────────────────┐                                        │
+│  │ Gateway (Segment-1)                          │                                        │
+│  │  ThreadLocal → TracingContext-1              │                                        │
+│  │                                              │                                        │
+│  │  [1] 创建 EntrySpan(id=0)                   │                                        │
+│  │      carrier 无效 → 新 traceId="trace-001"  │                                        │
+│  │  [2] 创建 ExitSpan(id=1) + inject           │                                        │
+│  │      carrier 写入: trace-001/seg-gw-001/1    │                                        │
+│  └──────────────┬──────────────────────────────┘                                        │
+│                 │ HTTP + Header "sw8"                                                    │
+│                 ▼                                                                        │
+│  ┌─────────────────────────────────────────────┐                                        │
+│  │ OrderService 主线程 (Segment-2)              │                                        │
+│  │  ThreadLocal → TracingContext-2              │                                        │
+│  │                                              │                                        │
+│  │  [1] 反序列化 carrier → extract             │                                        │
+│  │      traceId 继承 "trace-001"               │                                        │
+│  │      SegmentRef → (seg-gw-001, span=1)      │                                        │
+│  │  [2] 创建 EntrySpan(id=0)                   │                                        │
+│  │  [3] 创建 ExitSpan(id=1) → 调 Inventory    │──── HTTP + sw8 ─────┐                  │
+│  │      inject: trace-001/seg-order-001/1       │                     │                  │
+│  │  [4] stopSpan(ExitSpan-1) ← 收到响应        │                     ▼                  │
+│  │  [5] 创建 ExitSpan(id=2) → 发 RocketMQ     │    ┌────────────────────────────┐      │
+│  │      inject 到 msg property                  │    │ InventoryService (Segment-3)│      │
+│  │      carrier: trace-001/seg-order-001/2      │    │  extract → traceId=trace-001│      │
+│  │  [6] stopSpan(ExitSpan-2)                    │    │  SegmentRef→(seg-order,sp=1)│      │
+│  │  [7] capture() → ContextSnapshot            │    │  EntrySpan(id=0) + JDBC     │      │
+│  │      snapshot: trace-001/seg-order-001/0     │    │  ExitSpan(id=1) 无inject    │      │
+│  │  [8] submit(task + snapshot) 到线程池        │    │  → Segment-3 上报           │      │
+│  │  [9] stopSpan(EntrySpan-0) → Segment-2 上报 │    └────────────────────────────┘      │
+│  └──────────────┬──────────────────────────────┘                                        │
+│                 │ 线程池                                                                  │
+│                 ▼                                                                        │
+│  ┌─────────────────────────────────────────────┐                                        │
+│  │ OrderService 异步线程 (Segment-4)            │                                        │
+│  │  ThreadLocal → TracingContext-4（新线程新ctx）│                                        │
+│  │                                              │                                        │
+│  │  [1] continued(snapshot)                     │                                        │
+│  │      traceId 继承 "trace-001"               │                                        │
+│  │      SegmentRef → (seg-order-001, span=0)   │                                        │
+│  │  [2] 创建 LocalSpan(id=0)                   │                                        │
+│  │  [3] 执行通知逻辑                            │                                        │
+│  │  [4] stopSpan → Segment-4 上报              │                                        │
+│  └─────────────────────────────────────────────┘                                        │
+│                                                                                          │
+│                        RocketMQ Broker                                                   │
+│                 ┌──────────────────────────┐                                            │
+│                 │ Message Property:         │                                            │
+│                 │  "sw8" = "1-trace001-..." │                                            │
+│                 └────────────┬─────────────┘                                            │
+│                              │ 消费                                                      │
+│                              ▼                                                           │
+│  ┌─────────────────────────────────────────────┐                                        │
+│  │ PaymentService 消费者线程 (Segment-5)        │                                        │
+│  │  ThreadLocal → TracingContext-5              │                                        │
+│  │                                              │                                        │
+│  │  [1] 从 msg property 提取 sw8               │                                        │
+│  │  [2] 反序列化 carrier → extract             │                                        │
+│  │      traceId 继承 "trace-001"               │                                        │
+│  │      SegmentRef → (seg-order-001, span=2)   │                                        │
+│  │  [3] 创建 EntrySpan(id=0)                   │                                        │
+│  │  [4] 处理支付逻辑                            │                                        │
+│  │  [5] stopSpan → Segment-5 上报              │                                        │
+│  └─────────────────────────────────────────────┘                                        │
+│                                                                                          │
+│                              ▼ 所有 Segment 上报到 Collector                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ OAP Collector                                                                     │   │
+│  │                                                                                   │   │
+│  │  收到 5 个 Segment，traceId 都是 "trace-001"                                     │   │
+│  │  通过 SegmentRef 的 (parentSegmentId, parentSpanId) 还原调用树                    │   │
+│  │  存储到 ElasticSearch / 其他存储                                                   │   │
+│  │  UI 查询时按 traceId 聚合展示完整链路                                              │   │
+│  └──────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 9.13 方法调用时序表（按时间线排列）
+
+| 时间 | 位置 | 触发方法 | 源码方法调用链 | 数据变化 |
+|------|------|---------|--------------|---------|
+| T1 | Gateway | 请求到达 | `NettyRoutingFilterInterceptor.beforeMethod()` → `ContextManager.createEntrySpan(op, emptyCarrier)` → `new TracingContext()` → `new TraceSegment()` → `new EntrySpan(0,-1,op)` → `push(span)` | 新建 TracingContext-1, traceId=trace-001, Span栈=[Entry(0)] |
+| T2 | Gateway | 路由转发 | `beforeMethod()` → `ContextManager.createExitSpan(op, carrier, peer)` → `new ExitSpan(1,0,op,peer)` → `push(span)` → `inject(carrier)` → `carrier.serialize()` → `request.setHeader("sw8",value)` | Span栈=[Entry(0),Exit(1)], HTTP Header携带sw8 |
+| T3 | Gateway | 收到响应 | `afterMethod()` → `ContextManager.stopSpan()` ×2 → `segment.archive(span)` → `finish()` → `ListenerManager.notifyFinish(segment)` → `CONTEXT.remove()` | Segment-1完成上报, ThreadLocal清空 |
+| T4 | OrderService | 请求到达 | `TomcatInvokeInterceptor.beforeMethod()` → `carrier.deserialize(header)` → `ContextManager.createEntrySpan(op, carrier)` → `new TracingContext()` → `extract(carrier)` → `segment.relatedGlobalTraceId(carrier.traceId)` → `segment.ref(new TraceSegmentRef(carrier))` | 新建 TracingContext-2, traceId继承trace-001, refs=[→seg-gw-001] |
+| T5 | OrderService | 调HTTP | `HttpClientExecuteInterceptor.beforeMethod()` → `ContextManager.createExitSpan(op, carrier, peer)` → `inject(carrier)` → `request.setHeader("sw8",value)` | Span栈=[Entry(0),Exit(1)], 新sw8 Header: spanId=1 |
+| T6 | InventoryService | 请求到达 | `TomcatInvokeInterceptor.beforeMethod()` → 同T4流程 → `extract(carrier)` | 新建 TracingContext-3, traceId=trace-001, refs=[→seg-order-001,span=1] |
+| T7 | InventoryService | 查MySQL | `PreparedStatementExecuteMethodsInterceptor.beforeMethod()` → `ContextManager.createExitSpan(op, peer)` (无carrier版本，不inject) | Span栈=[Entry(0),Exit(1)], 无sw8传播 |
+| T8 | InventoryService | MySQL返回 | `afterMethod()` → `ContextManager.stopSpan()` | Span栈=[Entry(0)], Exit(1)归档 |
+| T9 | InventoryService | 请求结束 | `TomcatInvokeInterceptor.afterMethod()` → `stopSpan()` → `finish()` → 上报 | Segment-3完成上报 |
+| T10 | OrderService | 收到Inventory响应 | `HttpClientExecuteInterceptor.afterMethod()` → `stopSpan()` | Span栈=[Entry(0)], Exit(1)归档 |
+| T11 | OrderService | 发MQ | `MessageSendInterceptor.beforeMethod()` → `createExitSpan(op, carrier, peer)` → `inject(carrier)` → `message.putUserProperty("sw8", value)` | Span栈=[Entry(0),Exit(2)], MQ消息携带sw8 |
+| T12 | OrderService | MQ发送完成 | `afterMethod()` → `stopSpan()` | Span栈=[Entry(0)], Exit(2)归档 |
+| T13 | OrderService | 提交异步任务 | `RunnableWrapper构造` → `ContextManager.capture()` → `TracingContext.capture()` → `new ContextSnapshot(traceId, segId, spanId=0)` | 创建ContextSnapshot, 快照了主线程当前状态 |
+| T14 | OrderService异步线程 | 任务开始 | `RunnableWrapper.run()` → `ContextManager.continued(snapshot)` → `createLocalSpan(op+"/Thread")` → `new TracingContext()` → `TracingContext.continued(snapshot)` → `segment.relatedGlobalTraceId(snapshot.traceId)` → `segment.ref(new TraceSegmentRef(snapshot))` | 新建 TracingContext-4(子线程), traceId=trace-001, refs=[→seg-order-001,span=0] |
+| T15 | OrderService异步线程 | 任务结束 | `stopSpan()` → `finish()` → 上报 | Segment-4完成上报 |
+| T16 | OrderService主线程 | 请求结束 | `TomcatInvokeInterceptor.afterMethod()` → `stopSpan()` → `finish()` → 上报 | Segment-2完成上报 |
+| T17 | PaymentService | 消费消息 | `MessageConsumeInterceptor.beforeMethod()` → `msg.getUserProperty("sw8")` → `carrier.deserialize(value)` → `createEntrySpan(op, carrier)` → `extract(carrier)` | 新建 TracingContext-5, traceId=trace-001, refs=[→seg-order-001,span=2] |
+| T18 | PaymentService | 消费完成 | `afterMethod()` → `stopSpan()` → `finish()` → 上报 | Segment-5完成上报 |
+
+---
+
+### 9.14 设计哲学与工程智慧
+
+通过这个完整的 Walkthrough，可以提炼出 SkyWalking 的几个核心设计哲学：
+
+**1. 零侵入原则**
+
+整个追踪过程对业务代码完全透明。业务开发者写的代码没有任何 SkyWalking 的 import，不需要传递任何 context 参数。这是通过 Java Agent 的 premain + ByteBuddy 字节码增强实现的。代价是需要为每种框架/库编写专门的插件。
+
+**2. 统一的三步范式**
+
+无论哪种插件，都遵循相同的模式：
+
+```
+服务端/入口插件：
+  beforeMethod: 创建 ContextCarrier → 从载体提取 → createEntrySpan(op, carrier)
+  afterMethod:  stopSpan()
+
+客户端/出口插件：
+  beforeMethod: 创建 ContextCarrier → createExitSpan(op, carrier, peer) → 写入载体
+  afterMethod:  stopSpan()
+```
+
+**3. 最小化传播数据**
+
+sw8 协议只传递 8 个字段（不到 200 字节），足以还原完整调用链。不传递具体的 Span 细节（tags、logs 等），这些由各自 Segment 上报时携带。这极大降低了网络传播的开销。
+
+**4. 最终一致性**
+
+5 个 Segment 可能在不同时间到达 Collector（因为异步上报），但只要最终都到达了，Collector 就能通过 traceId + SegmentRef 还原完整链路。不需要同步等待、不需要分布式事务，天然适合分布式环境。
+
+**5. 采样决策前置**
+
+采样决策只在链路起点做一次，后续所有节点无条件跟随。这避免了"链路一半被采样、一半没被采样"导致的断链问题。通过 sw8 的第一个字段 "1"/"0" 传播采样结果。
