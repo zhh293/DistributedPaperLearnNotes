@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>$Title$</title>
+    <style>
+        body {
+            background-color: lightblue;
+        }
+    </style>
+    <meta charset="UTF-8">
+    </meta>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    </meta>
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css"></link>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>
+
+</head>
+<body>
+<h1>Hello from the client!</h1>
+<form action="/day16/cookieDemo1111" method="post">
+    <label for="message">Enter a message:</label>
+    <input type="text" id="message" name="message">
+    <button type="submit">Submit</button>
+</form>
+<br><br><br>
+<form  action="/content" method="post">
+    <button type="submit">Get Content</button>
+    <label for="content">Content:</label>
+    <textarea id="content" name="content" rows="4" cols="50"></textarea>
+</form>
+<a href="/day16/cookieDemo.html">post请求cookiedemo</a>
+</body>
+<script>
+   //页面加载的时候请求/day16/cookieDemo1111
+   $(function () {
+       $.ajax({
+           url:"/day16/cookieDemo1111",
+           type:"post",
+           data:{
+               message:"hello"
+           },
+           success:function (data) {
+               console.log(data);
+           }
+       })
+   })
+   //原来如此，servlet就是我们springboot里面的 controller层，但是又不太一样，因为springmvc帮你做了好多处理工作，比如自动注入，自动处理参数，自动处理返回值等等。
+</script>
+</html>
+<!--
+来整理一下子吧，
+1.表单的提交他是会寻找服务器的，而不会跳转到html页面，他的网址中会自动忽略html后缀，所以这样是不可以
+2.另外，每一个界面其实都因该对应一个servlet类或者多个类，当进行交互的时候，前端可以访问后端的网址来处理数据并且返回。
+比如啊说上面那个例子，index是最初始的页面，然后点击会跳转到下一个界面，下一个页面绑定着servlet和tomcat服务器，当触发某些事件的时候，会发送请求
+servlet进行处理和返回，从而产生动态的效果，这也是前后端交互的本质，欧克。。。。。。
+如果你是通过 JSP 页面访问，也可以在服务端使用 sendRedirect 跳转。
+protected void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    // 跳转到另一个页面或 Servlet
+    response.sendRedirect("anotherPage.html");
+}
+这样可以保证提交之后不会跳转到服务器。
+
+
+那么问题来了，这玩意怎么处理传来的数据，处理好了之后怎么返回啊，草了，连return都用不了，我感觉离手搓还太遥远了-->

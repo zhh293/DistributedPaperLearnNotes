@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:context="http://www.springframework.org/schema/context"
+       xsi:schemaLocation=" http://www.springframework.org/schema/beans
+                            http://www.springframework.org/schema/beans/spring-beans.xsd
+                            http://www.springframework.org/schema/context
+                            http://www.springframework.org/schema/context/spring-context.xsd
+                              ">
+  <!---->
+    <bean class="org.example.dao.impl.BookDaoImpl" id="bookDao" scope="singleton" init-method="init" destroy-method="destroy">
+
+    </bean>
+  <!--可以起别名，在bean标签中添加name字段-->
+   <!-- <bean class="org.example.service.impl.BookServiceImpl" id="bookService"  name="service,service2,bookEbi" scope="prototype">
+     <property name="bookDao" ref="userDao"/>
+      <property name="orderDao" ref="bookDao"/>
+        <property name="age" value="10"/>
+        <property name="dataName" value="张洪海"/>
+      <property name="userOrder" ref="userorder"/>
+    </bean>-->
+  <!--<bean class="org.example.service.impl.bookService" id="service3" autowire="byType">-->
+<!--  <bean class="org.example.service.impl.bookService" id="service3" autowire="byName">-->
+
+<!--  </bean>-->
+        <!--配置service和dao的关系
+
+        property 标签表示配置当前 bean 的属性
+name 属性表示配置哪一个属性,set方法里面的参数名字
+ref 属性表示参照哪一个 bean，ioc容器里面的某个bean对象-->
+     <!-- <property name="bookDao" ref="bookDao"/>
+    </bean>-->
+
+
+  <!--使用静态工厂实例化bean-->
+  <!--<bean id="orderDao" class="org.example.factory.OrderDaoFactory" factory-method="getBookDao">
+  </bean>-->
+
+  <!--使用实例化工厂-->
+  <!--<bean id="userFactory" class="org.example.factory.UserDaoFactory"/>
+  <bean id="userorder"  factory-method="createOrderDao" factory-bean="userFactory"/>
+  <bean id="userDao" class="org.example.factory.UserDaoFactoryBean"/>-->
+
+<!--开启context命名空间-->
+<!--使用context空间加载properties文件-->
+<!--  使用属性占位符${}读取properties文件中的属性-->
+
+</beans>
+       <!-- 一、加载方式
+        1. 使用 <context:property-placeholder> 标签
+通过该标签指定 properties 文件路径，Spring 会自动解析文件内容，供其他配置使用。
+示例：
+
+xml
+<context:property-placeholder location="classpath:jdbc.properties"/>
+
+多文件加载：若需加载多个文件，用逗号分隔路径，如：
+xml
+<context:property-placeholder location="classpath:jdbc.properties,classpath:redis.properties"/>
+
+
+在 XML 中使用属性值：
+xml
+<bean id="dataSource" class="org.springframework.jdbc.datasource.DriverManagerDataSource">
+  <property name="driverClassName" value="${jdbc.driver}"/>
+  <property name="url" value="${jdbc.url}"/>
+  <property name="username" value="${jdbc.username}"/>
+  <property name="password" value="${jdbc.password}"/>
+</bean>-->
+<!--
+很少用，记住，很少用！！！！！！！！！！
+-->
+<!--
+集合注入
+1.<property name="array">
+
+<array>
+
+<value>100</value>
+
+<value>200</value>
+
+<value>308</value>
+
+</array>
+
+</property> I
+
+其他数据类型都是这个格式
+比如set list
+
+2.map，properties这种类型
+<property name="map">
+
+<map>
+
+<entry key="country" value="china"/>
+
+<entry key="prciince" value="henan"/>
+
+<entry key="city" value="kaifeng"/>
+
+</map>
+
+</property>
+
+<property name="properties">
+
+<props>
+
+<prop key="country">china</prop>
+
+<prop key="country">china</prop>
+
+<prop key="country">china</prop>
+
+</props>
+
+</property>
+
+</bean>
+
+
+
+
+英文	中文
+id	bean 的 Id
+name	bean 别名
+class	bean 类型，静态工厂类，FactoryBean 类
+scope	控制 bean 的实例数量
+init - method	生命周期初始化方法
+destroy - method	生命周期销毁方法
+autowire	自动装配类型
+factory - method	bean 工厂方法，应用于静态工厂或实例工厂
+factory - bean	实例工厂 bean
+lazy - init	控制 bean 延迟加载
+
+
+<bean id="bookService" class="com.itheima.service.impl.BookServiceImpl">构造器注入引用类型
+<constructor-arg name="bookDao" ref="bookDao"/>构造器注入简单类型
+<constructor-arg name="userDao" ref="userDao"/>类型匹配与索引匹配
+<constructor-arg name="msg" value="WARN"/>setter注入引用类型
+<constructor-arg type="java.lang.String" index="3" value="WARN"/>setter注入简单类型
+<property name="bookDao" ref="bookDao"/>setter注入集合类型
+<property name="userDao" ref="userDao"/>list集合
+<property name="msg" value="WARN"/>集合注入简单类型
+<property name="names">集合注入引用类型
+<list>
+<value>itcast</value>
+<ref bean="dataSource"/>
+</list>
+</property>
+</bean>
+-->

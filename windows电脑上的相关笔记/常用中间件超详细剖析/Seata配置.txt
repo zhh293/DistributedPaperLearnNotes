@@ -1,0 +1,250 @@
+Seata配置，这玩意儿使用起来还是蛮复杂的
+
+
+
+步骤 1：添加 Seata 核心依赖（pom.xml）
+首先要引入正确的依赖，避免版本不兼容导致的通信问题：
+xml
+<!-- Spring Cloud Alibaba Seata 核心依赖 -->
+<dependency>
+    <groupId>com.alibaba.cloud</groupId>
+    <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+    <!-- 锁定版本，和Seata Server版本一致（关键！版本不一致必报错） -->
+    <version>2022.0.0.0-RC2</version>
+    <exclusions>
+        <!-- 排除默认的seata-all，引入和TC一致的版本 -->
+        <exclusion>
+            <groupId>io.seata</groupId>
+            <artifactId>seata-all</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+<!-- 引入和TC版本一致的seata-all -->
+<dependency>
+    <groupId>io.seata</groupId>
+    <artifactId>seata-all</artifactId>
+    <version>1.6.1</version> <!-- 必须和Seata Server版本一致 -->
+</dependency>
+
+
+
+步骤 2：添加 Seata 核心配置文件（必须！不能只靠 yaml）
+Seata 客户端需要两个核心配置文件（放在resources目录下），这是客户端找到 TC、建立通信的关键：
+配置文件 1：registry.conf（指定 TC 的注册中心，核心！）
+作用：告诉 Seata 客户端 “TC 注册在哪个注册中心（比如 Nacos），怎么找到 TC”。
+properties
+registry {
+  # TC的注册类型：nacos/eureka/zookeeper/file
+  type = "nacos"
+
+  nacos {
+    # Nacos地址（和TC的注册地址一致）
+    serverAddr = "127.0.0.1:8848"
+    # 命名空间（如果TC在自定义命名空间，必须填）
+    namespace = ""
+    # 分组（和TC的分组一致）
+    group = "SEATA_GROUP"
+    # TC的服务名（默认seata-server，和TC启动时的服务名一致）
+    serviceName = "seata-server"
+    # Nacos用户名密码（如果有配置）
+    username = "nacos"
+    password = "nacos"
+  }
+}
+
+config {
+  # 配置中心类型：nacos/file
+  type = "nacos"
+
+  nacos {
+    serverAddr = "127.0.0.1:8848"
+    namespace = ""
+    group = "SEATA_GROUP"
+    username = "nacos"
+    password = "nacos"
+  }
+}
+配置文件 2：file.conf（事务组、存储模式配置）
+作用：配置客户端的事务组、分支事务存储方式等，和 TC 的配置匹配。
+properties
+service {
+  # 事务组名称（必须和TC的事务组配置一致）
+  vgroupMapping.my_test_tx_group = "default"
+  # 关闭虚拟节点
+  disableGlobalTransaction = false
+}
+
+client {
+  rm {
+    # 异步提交缓冲队列大小
+    asyncCommitBufferLimit = 1000
+    # 重试次数
+    retryTimeout = 3000
+    # 表锁重试次数
+    tableMetaCheckEnable = true
+    reportRetryCount = 5
+    txLockRetryInterval = 10
+    txLockRetryTimes = 30
+  }
+  tm {
+    # 全局事务重试次数
+    commitRetryCount = 5
+    rollbackRetryCount = 5
+  }
+  undo {
+    # 开启undo_log
+    undoDataValidation = true
+    undoLogSerialization = "jackson"
+    undoLogTable = "undo_log"
+  }
+  log {
+    exceptionRate = 100
+  }
+}
+步骤 3：application.yaml 的完整配置（结合核心配置文件）
+yaml 里需要配置 Seata 的事务组、数据源代理（关键！Seata 需要代理数据源才能拦截 SQL），而非仅填 TC 地址：
+yaml
+spring:
+  # 1. 数据源配置（必须让Seata代理）
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/order_db?useUnicode=true&characterEncoding=utf8&useSSL=false
+    username: root
+    password: root
+  # 2. Seata核心配置
+  cloud:
+    alibaba:
+      seata:
+        # 事务组名称（必须和file.conf里的vgroupMapping一致）
+        tx-service-group: my_test_tx_group
+  # 3. 关闭数据源自动配置（避免和Seata代理冲突）
+  autoconfigure:
+    exclude: com.alibaba.druid.spring.boot.autoconfigure.DruidDataSourceAutoConfigure
+
+# 4. MyBatis配置（可选，确保SQL执行正常）
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.demo.entity
+
+# 5. Seata日志配置（方便排查问题）
+logging:
+  level:
+    io.seata: debug
+步骤 4：配置 Seata 数据源代理（核心！否则事务不生效）
+Seata 需要代理数据源才能拦截 SQL、记录 undo_log，必须手动配置数据源代理类（这是新手最容易漏的步骤）：
+java
+运行
+import com.alibaba.druid.pool.DruidDataSource;
+import io.seata.rm.datasource.DataSourceProxy;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+import javax.sql.DataSource;
+
+/**
+ * Seata数据源代理配置（必须！否则无法拦截SQL）
+ */
+@Configuration
+public class DataSourceConfig {
+
+    // 1. 读取yaml中的数据源配置
+    @Bean
+    @ConfigurationProperties(prefix = "spring.datasource")
+    public DataSource druidDataSource() {
+        return new DruidDataSource();
+    }
+
+    // 2. 用Seata代理数据源（Primary注解保证优先使用）
+    @Bean
+    @Primary
+    public DataSourceProxy dataSourceProxy(DataSource dataSource) {
+        return new DataSourceProxy(dataSource);
+    }
+}
+步骤 5：创建 undo_log 表（AT 模式必须！）
+AT 模式下，每个微服务的数据库都需要创建undo_log表（Seata 记录回滚日志用），缺少则直接报 “表不存在”：
+sql
+-- 注意：不同数据库的建表语句略有差异，以下是MySQL版本
+CREATE TABLE `undo_log` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `branch_id` bigint(20) NOT NULL,
+  `xid` varchar(100) NOT NULL,
+  `context` varchar(128) NOT NULL,
+  `rollback_info` longblob NOT NULL,
+  `log_status` int(11) NOT NULL,
+  `log_created` datetime NOT NULL,
+  `log_modified` datetime NOT NULL,
+  `ext` varchar(100) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `ux_undo_log` (`xid`,`branch_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4;
+步骤 6：配置 XID 传递拦截器（跨服务调用必须！）
+微服务间调用（比如 Feign）时，XID 需要通过请求头传递，否则 RM 无法关联全局事务，导致 “Global transaction not exist” 报错：
+Feign 拦截器配置（Spring Cloud）
+java
+运行
+import feign.RequestInterceptor;
+import feign.RequestTemplate;
+import io.seata.core.context.RootContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+/**
+ * Feign拦截器：传递XID（全局事务ID）
+ */
+@Configuration
+public class FeignSeataInterceptor {
+
+    @Bean
+    public RequestInterceptor seataXidInterceptor() {
+        return new RequestInterceptor() {
+            @Override
+            public void apply(RequestTemplate template) {
+                // 获取当前线程的XID，放入请求头
+                String xid = RootContext.getXID();
+                if (xid != null) {
+                    template.header(RootContext.KEY_XID, xid);
+                }
+            }
+        };
+    }
+}
+全局过滤器（确保 XID 在请求间传递）
+java
+运行
+import io.seata.core.context.RootContext;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import javax.servlet.FilterChain;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+
+/**
+ * 全局过滤器：从请求头获取XID，绑定到当前线程
+ */
+@Component
+public class SeataXidFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
+        // 从请求头获取XID
+        String xid = request.getHeader(RootContext.KEY_XID);
+        if (xid != null) {
+            // 绑定到当前线程
+            RootContext.bind(xid);
+        }
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            // 解绑XID，避免内存泄漏
+            if (xid != null) {
+                RootContext.unbind();
+            }
+        }
+    }
+}

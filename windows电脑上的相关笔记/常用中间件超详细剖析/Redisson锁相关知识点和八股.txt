@@ -1,0 +1,586 @@
+1. Redis分布式锁的基本原理与实现
+在分布式系统中，多个进程或线程可能需要同时访问共享资源。为了避免竞争条件和数据不一致的问题，分布式锁成为了一个重要的协调机制。Redis作为一种高性能的内存数据库，常被用来实现分布式锁。
+
+1.1 分布式锁的核心需求
+分布式锁需要满足以下几个基本要求：互斥性（在任何时刻只能有一个客户端持有锁）、安全性（锁只能由持有它的客户端释放）、可用性（即使客户端崩溃，锁最终也能被释放）和可重入性（同一客户端可以多次获取同一把锁）。
+
+1.2 基于SETNX的基础实现
+Redis的SETNX（SET if Not eXists）命令是实现分布式锁的基础。该命令在键不存在时设置键的值，并返回1；如果键已经存在，则不做任何操作并返回0。
+
+
+
+import redis
+import time
+import uuid
+
+class SimpleRedisLock:
+    def __init__(self, redis_client, lock_name, expire_time=10):
+        self.redis = redis_client
+        self.lock_name = lock_name
+        self.expire_time = expire_time
+    
+    def acquire_lock(self, acquire_timeout=10):
+        identifier = str(uuid.uuid4())
+        end = time.time() + acquire_timeout
+        
+        while time.time() < end:
+            # 使用SETNX尝试获取锁
+            if self.redis.setnx(self.lock_name, identifier):
+                # 设置过期时间，防止死锁
+                self.redis.expire(self.lock_name, self.expire_time)
+                return identifier
+            elif not self.redis.ttl(self.lock_name):
+                # 如果锁没有设置过期时间，重新设置
+                self.redis.expire(self.lock_name, self.expire_time)
+            
+            time.sleep(0.001)
+        
+        return False
+    
+    def release_lock(self, identifier):
+        with self.redis.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(self.lock_name)
+                    if pipe.get(self.lock_name) == identifier:
+                        pipe.multi()
+                        pipe.delete(self.lock_name)
+                        pipe.execute()
+                        return True
+                    pipe.unwatch()
+                    break
+                except redis.exceptions.WatchError:
+                    pass
+            return False
+
+
+
+1.3 原子操作的重要性
+上述实现有一个严重问题：SETNX和EXPIRE是两个独立操作，不是原子性的。如果在执行SETNX后客户端崩溃，来不及设置过期时间，就会导致死锁。
+
+Redis 2.6.12之后，我们可以使用增强的SET命令，将设置值和过期时间合并为一个原子操作
+
+
+def acquire_lock_atomic(self, acquire_timeout=10):
+    identifier = str(uuid.uuid4())
+    end = time.time() + acquire_timeout
+    
+    while time.time() < end:
+        # 使用SET命令的NX和EX参数实现原子操作
+        if self.redis.set(self.lock_name, identifier, nx=True, ex=self.expire_time):
+            return identifier
+        time.sleep(0.001)
+    
+    return False
+
+1.4 安全释放锁的实现
+释放锁时也需要确保原子性，避免误删其他客户端的锁。以下是一个常见的错误实现：
+# 错误的释放锁方式
+def release_lock_unsafe(self, identifier):
+    # 非原子操作：先检查后删除
+    if self.redis.get(self.lock_name) == identifier:
+        self.redis.delete(self.lock_name)
+        return True
+    return False
+
+上述实现的问题在于，检查锁和删除锁不是原子操作，可能在检查后、删除前，锁已过期并被其他客户端获取。正确的做法是使用Lua脚本保证原子性：
+
+
+# 正确的释放锁方式：使用Lua脚本
+def release_lock_safe(self, identifier):
+    lua_script = """
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+    else
+        return 0
+    end
+    """
+    script = self.redis.register_script(lua_script)
+    result = script(keys=[self.lock_name], args=[identifier])
+    return result == 1
+
+
+
+2. 控制Redis分布式锁的有效时长
+合理控制锁的有效时长是Redis分布式锁实现中的关键挑战。设置过短可能导致业务未完成锁就过期，设置过长则可能因客户端崩溃导致资源长时间不可用。
+
+ 基于业务评估的时长控制
+最简单的方法是根据业务操作的最大预计时间设置锁的过期时间：
+
+
+public class BusinessAwareRedisLock {
+    private Jedis jedis;
+    private String lockKey;
+    private int baseExpireTime; // 基础过期时间
+    
+    public boolean acquireLock(String requestId, BusinessType bizType) {
+        // 根据业务类型调整过期时间
+        int expireTime = calculateExpireTime(bizType);
+        String result = jedis.set(lockKey, requestId, "NX", "EX", expireTime);
+        return "OK".equals(result);
+    }
+    
+    private int calculateExpireTime(BusinessType bizType) {
+        switch (bizType) {
+            case QUICK_OPERATION:
+                return baseExpireTime; // 短操作，使用基础时间
+            case COMPLEX_CALCULATION:
+                return baseExpireTime * 3; // 复杂计算，延长锁时间
+            case EXTERNAL_SYSTEM_CALL:
+                return baseExpireTime * 5; // 外部系统调用，进一步延长
+            default:
+                return baseExpireTime;
+        }
+    }
+}
+
+
+ Watchdog机制
+Redisson框架实现了更为完善的Watchdog（看门狗）机制，它解决了简单续期机制的一些局限性：
+
+智能调度：使用时间轮算法高效管理大量锁的续期任务
+异常处理：客户端崩溃时自动停止续期
+配置灵活：续期间隔可配置，默认为锁过期时间的1/3
+
+
+
+// Redisson Watchdog使用示例
+public void useRedissonLock() {
+    RedissonClient redisson = Redisson.create();
+    RLock lock = redisson.getLock("myLock");
+    
+    try {
+        // 获取锁，如果不设置leaseTime，会启动看门狗
+        lock.lock();
+        // 或者指定等待时间和锁过期时间
+        boolean isLocked = lock.tryLock(10, 30, TimeUnit.SECONDS);
+        
+        if (isLocked) {
+            // 执行业务逻辑
+            processBusiness();
+        }
+    } finally {
+        lock.unlock();
+    }
+}
+
+
+
+
+在实际应用中，选择哪种方案需要考虑业务特点、团队技术栈和运维成本等因素。
+
+3. Redisson的可重入分布式锁实现
+可重入锁是分布式锁中的重要概念，它允许同一个线程多次获取同一把锁，而不会导致死锁。Redisson通过巧妙的数据结构和算法实现了这一功能。
+
+3.1 可重入锁的概念与价值
+可重入性（Reentrancy）是指同一个线程可以多次获取同一把锁的特性。考虑以下场景：
+
+
+public class ReentrantExample {
+    private DistributedLock lock;
+    
+    public void methodA() {
+        lock.lock();
+        try {
+            methodB(); // 调用methodB，需要再次获取锁
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    public void methodB() {
+        lock.lock(); // 如果是不可重入锁，这里会死锁
+        try {
+            // 执行操作
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+
+
+
+如果锁不可重入，当线程调用methodA时，在methodB中尝试再次获取锁会导致线程自身阻塞，形成死锁。可重入锁通过记录锁的持有者和重入次数来解决这个问题。
+
+3.2 Redisson的可重入锁数据结构
+Redisson使用Redis的Hash结构存储可重入锁的信息：
+
+Key：锁的名称
+Field：客户端标识 + 线程ID
+Value：重入次数
+这种设计允许多个客户端和线程同时跟踪它们的锁状态，而不会互相干扰。
+
+3.3 加锁逻辑实现
+Redisson获取可重入锁的Lua脚本源码如下：
+
+-- Redisson加锁Lua脚本
+if (redis.call('exists', KEYS[1]) == 0) then 
+    -- 锁不存在，创建新锁
+    redis.call('hincrby', KEYS[1], ARGV[2], 1); 
+    redis.call('pexpire', KEYS[1], ARGV[1]); 
+    return nil; 
+end; 
+
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then 
+    -- 锁已存在且由当前线程持有，重入次数+1
+    redis.call('hincrby', KEYS[1], ARGV[2], 1); 
+    redis.call('pexpire', KEYS[1], ARGV[1]); 
+    return nil; 
+end; 
+
+-- 锁被其他线程持有，返回锁的剩余生存时间
+return redis.call('pttl', KEYS[1]);
+
+
+这个脚本实现了以下逻辑：
+
+如果锁不存在，创建新锁并设置重入次数为1
+如果锁已存在且由当前线程持有，增加重入次数
+如果锁被其他线程持有，返回锁的剩余生存时间
+
+
+
+3.4 释放锁逻辑实现
+对应的释放锁Lua脚本如下：
+
+
+-- Redisson释放锁Lua脚本
+if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then 
+    return nil;
+end; 
+
+-- 减少重入次数
+local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); 
+if (counter > 0) then 
+    -- 重入次数仍大于0，更新过期时间
+    redis.call('pexpire', KEYS[1], ARGV[2]); 
+    return 0; 
+else 
+    -- 重入次数为0，删除锁
+    redis.call('del', KEYS[1]); 
+    -- 发布锁释放消息
+    redis.call('publish', KEYS[2], ARGV[1]); 
+    return 1; 
+end; 
+
+return nil;
+
+
+
+
+释放锁时，Redisson会：
+
+检查当前线程是否持有锁
+减少重入次数
+如果重入次数大于0，只更新过期时间
+如果重入次数为0，删除锁并发布释放消
+
+
+
+
+实际中则直接使用就可以了，不用考虑这些源码
+
+
+
+
+
+分布式锁的主从一致性问题
+4.1 主从架构下的锁失效问题
+Redis主从复制是异步的，考虑以下时序：
+
+客户端A在Master节点获取锁成功
+Master在将锁信息同步到Slave之前崩溃
+Sentinel将某个Slave提升为新的Master
+客户端B向新的Master申请相同的锁，由于同步延迟，新Master上没有锁记录
+客户端B获取锁成功
+现在客户端A和客户端B同时持有锁，违反互斥性
+这种问题发生的根本原因在于Redis的主从复制是异步的，无法保证强一致性。
+
+
+
+
+
+4.2 RedLock算法原理
+为了解决主从一致性问题，Redis作者Antirez提出了RedLock算法。基本思想是：同时向多个独立的Redis实例申请锁，只有从大多数(N/2+1)实例上获得锁，才算真正获取成功。
+
+RedLock算法步骤如下：
+
+获取当前时间（精确到毫秒）
+依次向N个Redis实例申请锁（使用相同的key和随机值）
+计算获取锁所需的总时间（当前时间减去步骤1的时间）
+如果从大多数实例获取锁成功，且总时间小于锁过期时间，则获取成功
+如果获取失败，则向所有实例发送释放锁命令
+4.3 Redisson中的RedLock实现
+Redisson提供了RedLock的实现，以下是使用示例：
+
+
+
+
+
+public class RedLockExample {
+    public void useRedLock() {
+        // 创建多个Redis客户端，指向不同的Redis实例
+        RedissonClient client1 = Redisson.create(createConfig("redis://127.0.0.1:6379"));
+        RedissonClient client2 = Redisson.create(createConfig("redis://127.0.0.1:6380"));
+        RedissonClient client3 = Redisson.create(createConfig("redis://127.0.0.1:6381"));
+        
+        // 创建多个RLock对象
+        RLock lock1 = client1.getLock("lock");
+        RLock lock2 = client2.getLock("lock");
+        RLock lock3 = client3.getLock("lock");
+        
+        // 创建RedLock
+        RedissonRedLock redLock = new RedissonRedLock(lock1, lock2, lock3);
+        
+        try {
+            // 尝试获取锁
+            boolean isLocked = redLock.tryLock(10, 30, TimeUnit.SECONDS);
+            if (isLocked) {
+                // 获取成功，执行业务逻辑
+                processBusiness();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            redLock.unlock();
+        }
+        
+        // 关闭客户端
+        client1.shutdown();
+        client2.shutdown();
+        client3.shutdown();
+    }
+    
+    private Config createConfig(String address) {
+        Config config = new Config();
+        config.useSingleServer().setAddress(address);
+        return config;
+    }
+}
+
+
+
+
+4.4 RedLock的争议与局限性
+尽管RedLock算法被广泛讨论，但在实际应用中存在一些争议和局限性：
+
+性能开销：需要操作多个Redis实例，性能明显下降
+部署复杂性：需要维护多个独立的Redis实例
+时钟依赖：对系统时钟一致性有要求
+故障恢复：实例故障恢复后可能包含旧数据
+Martin Kleppmann曾指出，RedLock依赖于一个可能不成立的系统模型假设，特别是在系统时钟发生跳跃时可能无法保证互斥性。
+
+
+
+在实际应用中，需要根据业务对一致性的要求程度来选择合适的方案。对于大多数场景，单Redis实例加合适的过期时间已经足够，只有在极高要求的场景下才考虑RedLock或其他强一致性方案。
+
+
+
+
+
+
+强一致性方案
+
+
+除了REDLock还有什么呢
+
+强推的一个就是
+
+
+ZooKeeper通过顺序临时节点实现分布式锁：
+
+所有客户端在指定目录下创建顺序临时节点
+判断自己创建的节点是否是最小序号节点
+如果是，获取锁成功；如果不是，监听前一个节点的删除事件
+持有锁的客户端完成后删除节点，触发下一节点获取锁
+这种实现方式天然避免了Redis分布式锁的主从一致性问题。
+
+
+public class ZooKeeperDistributedLock {
+    private final ZooKeeper zooKeeper;
+    private final String lockPath;
+    private String currentPath;
+    private String previousPath;
+    
+    public ZooKeeperDistributedLock(ZooKeeper zooKeeper, String lockPath) {
+        this.zooKeeper = zooKeeper;
+        this.lockPath = lockPath;
+    }
+    
+    public void lock() throws Exception {
+        // 创建顺序临时节点
+        currentPath = zooKeeper.create(lockPath + "/lock-", 
+                                      null, 
+                                      ZooDefs.Ids.OPEN_ACL_UNSAFE, 
+                                      CreateMode.EPHEMERAL_SEQUENTIAL);
+        
+        // 获取所有子节点，并排序
+        List<String> children = zooKeeper.getChildren(lockPath, false);
+        Collections.sort(children);
+        
+        // 判断当前节点是否是最小节点
+        String currentNode = currentPath.substring(lockPath.length() + 1);
+        int currentIndex = children.indexOf(currentNode);
+        
+        if (currentIndex == 0) {
+            // 当前节点是最小节点，获取锁成功
+            return;
+        } else {
+            // 监听前一个节点
+            previousPath = lockPath + "/" + children.get(currentIndex - 1);
+            CountDownLatch latch = new CountDownLatch(1);
+            
+            // 设置监听器
+            Stat stat = zooKeeper.exists(previousPath, new Watcher() {
+                @Override
+                public void process(WatchedEvent event) {
+                    if (event.getType() == Event.EventType.NodeDeleted) {
+                        latch.countDown();
+                    }
+                }
+            });
+            
+            if (stat != null) {
+                latch.await(); // 等待前一个节点释放锁
+            }
+        }
+    }
+    
+    public void unlock() throws Exception {
+        zooKeeper.delete(currentPath, -1);
+    }
+}
+
+
+
+
+
+etcd分布式锁
+etcd是另一个提供强一致性的分布式键值存储系统，基于Raft共识算法实现。
+
+
+public class EtcdDistributedLock {
+    private final Client etcdClient;
+    private final String lockKey;
+    private long leaseId;
+    
+    public EtcdDistributedLock(Client etcdClient, String lockKey) {
+        this.etcdClient = etcdClient;
+        this.lockKey = lockKey;
+    }
+    
+    public boolean tryLock(long timeout, TimeUnit unit) throws Exception {
+        // 创建租约
+        LeaseGrantResponse leaseGrant = etcdClient.getLeaseClient().grant(30).get();
+        leaseId = leaseGrant.getID();
+        
+        // 尝试获取锁
+        PutResponse putResponse = etcdClient.getKVClient()
+                .put(ByteSequence.from(lockKey.getBytes()),
+                     ByteSequence.from(String.valueOf(leaseId).getBytes()),
+                     PutOption.newBuilder().withLeaseId(leaseId).withPrevKV().build())
+                .get(timeout, unit);
+        
+        // 如果put成功，或者key不存在，则获取锁成功
+        return putResponse.getPrevKv() == null;
+    }
+    
+    public void unlock() throws Exception {
+        if (leaseId != 0) {
+            etcdClient.getLeaseClient().revoke(leaseId);
+        }
+    }
+}
+
+
+
+在选择分布式锁方案时，需要考虑以下因素：
+
+一致性要求：如果业务要求强一致性，Redis可能不是最佳选择
+性能要求：Redis在性能方面有明显优势
+运维成本：ZooKeeper和etcd需要维护独立集群，增加运维复杂度
+技术栈：考虑团队对相关技术的熟悉程度
+对于大多数互联网应用，Redis分布式锁已经能够满足需求。只有在金融、交易等对一致性有极高要求的场景下，才需要考虑ZooKeeper或etcd。
+
+
+
+
+
+
+
+
+
+
+
+讲一下Redisson锁吧
+
+
+首先
+使用 Redis 实现分布式锁的基本思路是：
+SETNX lock_key thread_id
+
+只要返回 1，说明加锁成功。否则说明其他线程已经获得锁，当前线程就拿不到。
+
+
+但删的时候会有误删他人锁的风险。
+
+必须先判断锁是否是自己加的，再删除，需要两步操作，而 Redis 是单线程的，这两步操作如果分开执行就不是原子操作，可能导致严重问题。
+
+所以Redisson通过LUA脚本将判断+删除写成一个 Redis 命令，保证原子性。
+
+
+
+然后枷锁肯定要设置过期时间，但是如果业务还没执行完，锁就过期了。那其他线程就能拿到锁，造成并发执行了！
+
+搞一个看门狗线程，定时续期：
+
+每隔一段时间（比如 10 秒）给锁续命；
+只要业务没执行完，锁就不会被 Redis 自动释放。
+业务线程挂了，看门狗还在续期怎么办？
+设置看门狗线程为“守护线程”！
+守护线程的生命周期依赖主线程，业务线程一挂，看门狗自然终止。要守护的人都挂了，看门狗还有什么意义？
+
+
+
+setnx是不可重入的，但是如果一个线程在方法 A 中获得了锁，又在方法 B 中再次尝试加锁，会失败
+
+Redisson 使用 Hash 结构来实现可重入：
+
+key：锁的名称；
+field：UUID + threadId，保证线程唯一；
+value：重入次数（计数器）。
+
+
+
+
+假设线程没抢到锁，是立即返回失败，还是等等再试？
+
+分布式锁如何阻塞？
+Redisson 使用了 Redis 的“发布/订阅”机制：
+
+没抢到锁的线程订阅一个频道，阻塞等待；
+拿到锁的线程执行完任务后发布消息；
+被阻塞线程收到消息后再去抢锁；
+超时机制控制，防止死等。
+
+
+
+
+红锁机制先不讲了
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

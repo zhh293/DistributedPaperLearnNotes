@@ -1,0 +1,13 @@
+
+
+
+
+hutool:
+  mail:
+    host: smtp.qq.com
+    port: 587
+    from: 928198963@qq.com
+    user: 928198963@qq.com
+    pass: qaufkhwqauirfyuiqwfg
+    starttls-enable: true
+    debug: true

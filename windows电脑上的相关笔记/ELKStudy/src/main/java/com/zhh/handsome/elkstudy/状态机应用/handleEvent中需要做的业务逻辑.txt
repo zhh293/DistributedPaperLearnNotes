@@ -1,0 +1,217 @@
+场景 1：同步核心业务 —— 放在handleEvent中「状态校验后，乐观锁更新前」
+核心业务：指和状态变更强相关、需要保证原子性的业务逻辑，失败则状态不能更新，比如：
+支付（PAY）：扣减商品库存、生成支付单、冻结用户余额；
+发货（SHIP）：生成物流单、扣减仓库库存、更新商品库存；
+取消（CANCEL）：恢复商品库存、解冻用户余额、关闭支付单（如果未支付）。
+放置位置：handleEvent方法中，步骤 2（校验状态流转）之后，步骤 3（乐观锁更新状态）之前，并通过数据库事务保证「业务逻辑执行」和「状态更新」的原子性。
+代码改造示例（新增事务 + 支付核心业务）
+你的代码只需新增事务注解和业务逻辑执行步骤，完全复用现有架构：
+java
+运行
+/**
+ * 统一处理状态流转
+ * 新增@Transactional：保证业务逻辑和状态更新的原子性
+ */
+@Transactional(rollbackFor = Exception.class)
+private Order handleEvent(String orderId, OrderEvent event) {
+    // 1. 获取订单
+    Order order = orderRepository.findById(orderId);
+    if (order == null) {
+        throw new RuntimeException("Order not found: " + orderId);
+    }
+
+    // 2. 检查状态流转是否合法
+    OrderState currentState = order.getState();
+    OrderState nextState = orderStateMachine.getNextState(currentState, event)
+            .orElseThrow(() -> new RuntimeException(
+                    String.format("Invalid transition: Cannot trigger %s from %s", event, currentState)));
+
+    // ====== 核心业务代码：放在这里！！！ ======
+    // 根据事件执行对应的同步核心业务，失败则抛出异常，事务回滚，状态不更新
+    executeCoreBusiness(order, event);
+
+    // 3. 乐观锁更新 (Attempt to update with CAS)
+    boolean success = orderRepository.updateStateWithVersion(orderId, nextState, order.getVersion());
+    if (!success) {
+        throw new RuntimeException("Concurrency Error: Order state has been changed by another transaction. Please retry.");
+    }
+
+    // 4. 记录变更日志 (Audit Log)
+    logStateChange(order, currentState, nextState, event);
+
+    // 5. 发送事件 (Decouple business logic)
+    eventPublisher.publishEvent(new OrderStateChangedEvent(this, orderId, currentState, nextState));
+
+    // 返回更新后的订单
+    return orderRepository.findById(orderId);
+}
+
+/**
+ * 执行同步核心业务逻辑
+ * 策略模式：不同事件执行不同业务，后续扩展只需新增case，无需改其他代码
+ */
+private void executeCoreBusiness(Order order, OrderEvent event) {
+    String orderId = order.getOrderId();
+    switch (event) {
+        case PAY:
+            // 支付核心业务：扣库存、生成支付单、冻结余额等
+            inventoryService.deductStock(order.getOrderId(), order.getProductId(), order.getNum());
+            payService.createPayOrder(orderId, order.getUserId(), order.getAmount());
+            userService.freezeBalance(order.getUserId(), order.getAmount());
+            log.info("Pay core business executed for order: {}", orderId);
+            break;
+        case SHIP:
+            // 发货核心业务：生成物流单、扣仓库库存等
+            logisticsService.createLogisticsOrder(orderId, order.getUserId(), order.getAddress());
+            warehouseService.deductStock(orderId, order.getProductId(), order.getNum());
+            log.info("Ship core business executed for order: {}", orderId);
+            break;
+        case CANCEL:
+            // 取消核心业务：恢复库存、解冻余额、关闭支付单等
+            inventoryService.restoreStock(orderId, order.getProductId(), order.getNum());
+            userService.unfreezeBalance(order.getUserId(), order.getAmount());
+            payService.closePayOrder(orderId);
+            log.info("Cancel core business executed for order: {}", orderId);
+            break;
+        case COMPLETE:
+            // 完成核心业务：解冻商家资金、更新商品销量等
+            merchantService.unfreezeFunds(order.getMerchantId(), order.getAmount());
+            productService.updateSales(order.getProductId(), order.getNum());
+            log.info("Complete core business executed for order: {}", orderId);
+            break;
+        default:
+            throw new RuntimeException("Unsupported event for core business: " + event);
+    }
+}
+核心优势：
+原子性保障：通过@Transactional注解，让「业务逻辑执行」和「状态更新」在同一个事务中，任意一步失败，整个事务回滚，绝对保证数据一致性；
+职责分离：状态机仍只做规则判断，业务逻辑放在OrderService的专门方法中，代码清晰，维护方便；
+扩展性好：新增事件 / 业务逻辑，只需在executeCoreBusiness中加一个case，无需改状态机代码，符合开闭原则；
+异常处理简单：业务逻辑执行失败（如库存不足），直接抛出异常，事务回滚，状态不更新，无需手动处理。
+
+
+
+
+
+
+
+场景 2：异步非核心业务 —— 放在OrderStateChangedEvent的事件监听器中
+非核心业务：指和状态变更弱相关、无需保证原子性的业务逻辑，失败不影响核心流程，比如：
+支付成功：发送短信通知、推送 APP 消息、扣减用户积分、生成统计数据；
+发货成功：发送物流提醒、更新订单物流轨迹、同步数据到报表系统；
+完成订单：发送评价提醒、返还优惠券、同步数据到大数据平台。
+放置位置：通过Spring 事件监听机制，编写OrderStateChangedEvent的监听器，异步执行这些非核心业务，完全和核心流程解耦。
+代码实现示例（事件监听器）
+java
+运行
+/**
+ * 订单状态变更事件监听器
+ * 处理异步非核心业务，不阻塞核心流程
+ */
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class OrderStateChangedListener {
+
+    private final SmsService smsService;
+    private final PushService pushService;
+    private final PointService pointService;
+    private final CouponService couponService;
+
+    /**
+     * 监听支付成功事件（CREATED→PAID）
+     */
+    @EventListener(condition = "#event.oldState == T(com.zhh.handsome.elkstudy.状态机应用.OrderState).CREATED && #event.newState == T(com.zhh.handsome.elkstudy.状态机应用.OrderState).PAID")
+    public void onOrderPaid(OrderStateChangedEvent event) {
+        String orderId = event.getOrderId();
+        log.info("Handling order paid async business: {}", orderId);
+        // 1. 发送支付成功短信
+        smsService.sendSms(event.getUserId(), "您的订单" + orderId + "已支付成功，我们将尽快为您发货！");
+        // 2. 推送APP支付成功消息
+        pushService.pushMsg(event.getUserId(), "订单支付成功", "订单" + orderId + "已支付，等待发货");
+        // 3. 扣减用户积分（示例，实际可能是加积分）
+        pointService.deductPoint(event.getUserId(), 100);
+        log.info("Order paid async business completed: {}", orderId);
+    }
+
+    /**
+     * 监听发货成功事件（PAID→SHIPPED）
+     */
+    @EventListener(condition = "#event.oldState == T(com.zhh.handsome.elkstudy.状态机应用.OrderState).PAID && #event.newState == T(com.zhh.handsome.elkstudy.状态机应用.OrderState).SHIPPED")
+    public void onOrderShipped(OrderStateChangedEvent event) {
+        String orderId = event.getOrderId();
+        log.info("Handling order shipped async business: {}", orderId);
+        // 1. 发送物流提醒短信
+        smsService.sendSms(event.getUserId(), "您的订单" + orderId + "已发货，物流单号：XXX，请及时查收！");
+        // 2. 推送APP物流消息
+        pushService.pushMsg(event.getUserId(), "订单已发货", "您的订单已发出，可在订单详情查看物流轨迹");
+        log.info("Order shipped async business completed: {}", orderId);
+    }
+
+    /**
+     * 监听订单完成事件（SHIPPED→COMPLETED）
+     */
+    @EventListener(condition = "#event.oldState == T(com.zhh.handsome.elkstudy.状态机应用.OrderState).SHIPPED && #event.newState == T(com.zhh.handsome.elkstudy.状态机应用.OrderState).COMPLETED")
+    public void onOrderCompleted(OrderStateChangedEvent event) {
+        String orderId = event.getOrderId();
+        log.info("Handling order completed async business: {}", orderId);
+        // 1. 发送评价提醒
+        smsService.sendSms(event.getUserId(), "您的订单" + orderId + "已完成，欢迎对商品进行评价！");
+        // 2. 返还优惠券
+        couponService.returnCoupon(event.getUserId(), orderId);
+        // 3. 同步数据到报表系统
+        reportService.syncOrderData(orderId);
+        log.info("Order completed async business completed: {}", orderId);
+    }
+}
+核心优势：
+核心流程无阻塞：非核心业务异步执行，不影响核心的「状态更新」流程，提升接口响应速度（比如支付接口无需等待短信发送完成再返回）；
+业务完全解耦：新增 / 修改非核心业务，只需新增 / 修改监听器，无需改OrderService的核心代码；
+异常隔离：非核心业务执行失败（如短信发送失败），不会影响核心流程（订单状态已经更新为已支付），后续可通过重试机制处理（如定时任务重发短信）；
+可灵活扩展：支持多个监听器监听同一个事件，比如同时发送短信和推送 APP，只需写两个监听器即可。
+
+
+
+
+
+
+
+
+
+
+
+生产环境中，乐观锁更新失败（并发冲突）是高频场景，建议给handleEvent方法加重试机制（如基于 Guava 的Retryer），避免用户直接看到错误，提升用户体验：
+java
+运行
+// 引入Guava重试依赖
+<dependency>
+    <groupId>com.google.guava</groupId>
+    <artifactId>guava-retrying</artifactId>
+    <version>2.0.0</version>
+</dependency>
+
+// 在handleEvent中加重试机制
+private Order handleEvent(String orderId, OrderEvent event) {
+    // 定义重试规则：乐观锁异常重试3次，每次间隔100ms
+    Retryer<Order> retryer = RetryerBuilder.<Order>newBuilder()
+            .retryIfExceptionOfType(RuntimeException.class)
+            .retryIfResult(Objects::isNull)
+            .withWaitStrategy(WaitStrategies.fixedWait(100, TimeUnit.MILLISECONDS))
+            .withStopStrategy(StopStrategies.stopAfterAttempt(3))
+            .withRetryListener(new RetryListener() {
+                @Override
+                public <V> void onRetry(Attempt<V> attempt) {
+                    log.warn("Order state update retry: orderId={}, event={}, attempt={}",
+                            orderId, event, attempt.getAttemptNumber());
+                }
+            })
+            .build();
+
+    try {
+        return retryer.call(() -> {
+            // 原有handleEvent逻辑...
+        });
+    } catch (ExecutionException | RetryException e) {
+        throw new OrderBusinessException("订单状态更新失败：并发冲突，建议稍后重试");
+    }
+}

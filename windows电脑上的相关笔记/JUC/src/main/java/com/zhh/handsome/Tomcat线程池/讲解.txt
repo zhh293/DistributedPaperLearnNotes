@@ -1,0 +1,182 @@
+一、先回顾：Java 原生 ThreadPoolExecutor（核心基础）
+Tomcat 线程池是基于原生线程池扩展的，先掌握原生核心，面试时才能讲清 “继承与改造” 的逻辑：
+1. 原生线程池核心结构
+java
+运行
+public ThreadPoolExecutor(
+    int corePoolSize,        // 核心线程数（常驻线程，不会轻易销毁）
+    int maximumPoolSize,     // 最大线程数（线程池能创建的最大线程数）
+    long keepAliveTime,      // 非核心线程空闲超时时间
+    TimeUnit unit,           // 超时时间单位
+    BlockingQueue<Runnable> workQueue,  // 任务队列（核心线程满时存放任务）
+    ThreadFactory threadFactory,        // 线程创建工厂
+    RejectedExecutionHandler handler     // 拒绝策略（线程+队列都满时的处理方式）
+)
+2. 原生线程池执行流程（面试必背）
+提交任务 →① 核心线程数未满 → 创建核心线程执行；② 核心线程满 → 任务入队列；③ 队列满 → 创建非核心线程执行；④ 非核心线程到最大数 → 触发拒绝策略。
+3. 原生线程池的 “痛点”（Tomcat 改造的原因）
+原生是 **“队列优先”：核心线程满了先入队列，队列满了才扩容线程。
+但 Web 场景（Tomcat 处理 HTTP 请求）需要低延迟 **：如果请求先排队，队列满了才扩容，会导致大量请求等待，用户体验差。
+二、Tomcat 线程池的核心结构（基于原生扩展）
+Tomcat 的线程池核心实现类是 org.apache.tomcat.util.threads.ThreadPoolExecutor（注意包名，不是 JDK 的），它继承了 JDK 的 java.util.concurrent.ThreadPoolExecutor，并做了关键改造。
+
+
+
+1. Tomcat 线程池的核心组件（面试重点）
+组件	作用
+自定义 ThreadPoolExecutor	重写execute()方法，修改任务提交逻辑（核心改造点）
+TaskQueue（核心）	自定义阻塞队列，重写offer()方法，配合线程池实现 “线程优先” 策略
+NamedThreadFactory	给线程命名（如http-nio-8080-exec-1），方便排查问题（原生无命名）
+自定义拒绝策略	如AbortWithReport（拒绝时打印日志 + 抛异常，原生只有基础拒绝策略）
+
+
+
+
+2. Tomcat 线程池的核心改造（面试高频）
+核心目标：把原生 “队列优先” 改为 **“线程优先”**（先扩容线程，再入队列），适配 Web 场景：
+步骤 1：重写execute()方法，提交任务时先判断 “是否能创建新线程”（未到 maxThreads）；
+步骤 2：自定义TaskQueue重写offer()方法：
+若线程池还能创建新线程（未到 maxThreads），offer()返回false，让线程池先创建线程执行任务；
+只有线程数到 maxThreads 后，任务才会入队列；
+队列也满了，才触发拒绝策略。
+
+
+
+
+
+
+
+
+
+
+
+3. Tomcat 线程池核心参数（面试常问，对应配置文件）
+Tomcat 的server.xml中配置线程池的核心参数，对应原生线程池：
+xml
+<Executor name="tomcatThreadPool"
+    namePrefix="catalina-exec-"   <!-- 线程名前缀 -->
+    maxThreads="200"             <!-- 最大线程数（对应原生maximumPoolSize） -->
+    minSpareThreads="10"         <!-- 核心线程数（对应原生corePoolSize） -->
+    maxIdleTime="60000"          <!-- 非核心线程空闲超时时间（ms） -->
+    queueCapacity="100"         <!-- 任务队列容量（对应原生workQueue的大小） -->
+    rejectedExecutionHandler="org.apache.tomcat.util.threads.AbortWithReport"/>
+三、Tomcat 线程池与原生线程池的核心关系（面试核心）
+1. 继承关系（基础）
+Tomcat 线程池是 JDK ThreadPoolExecutor的子类，复用了原生线程池的核心机制：
+复用线程创建 / 销毁 / 复用的基础逻辑；
+复用corePoolSize/maximumPoolSize/keepAliveTime等核心参数的语义；
+复用阻塞队列的基础特性。
+2. 核心差异（面试必答）
+维度	Java 原生线程池	Tomcat 线程池
+任务提交策略	队列优先（核心满→入队列→扩线程）	线程优先（核心满→扩线程→入队列）
+队列实现	通用队列（如 LinkedBlockingQueue）	自定义 TaskQueue（重写 offer ()）
+线程命名	无统一命名（默认 pool-1-thread-1）	自定义命名（便于问题排查）
+拒绝策略	基础策略（如 AbortPolicy）	增强策略（如 AbortWithReport，打印日志）
+适配场景	通用后台任务（如批处理）	Web 请求处理（低延迟、高并发）
+3. Tomcat 线程池执行流程（面试口述版）
+提交 HTTP 请求任务 →① 核心线程（minSpareThreads）未满 → 创建核心线程执行；② 核心线程满 → 判断是否到最大线程数（maxThreads）→ 未到则创建非核心线程执行；③ 到最大线程数 → 任务入 TaskQueue 队列；④ 队列也满（queueCapacity）→ 触发拒绝策略（如返回 503 错误）。
+四、面试高频追问及回答模板
+问：Tomcat 为什么要自定义线程池，而不直接用 JDK 原生的？答：原生线程池是 “队列优先”，核心线程满了先入队列，队列满了才扩容线程，适合后台批处理；但 Tomcat 处理 HTTP 请求需要低延迟，若请求先排队，会导致用户等待，所以 Tomcat 改为 “线程优先”，先扩容到最大线程数，再入队列，提升请求响应速度。
+问：TaskQueue 的核心作用是什么？答：TaskQueue 重写了offer()方法，当线程池还能创建新线程（未到 maxThreads）时，offer()返回 false，迫使线程池先创建线程执行任务，而不是先入队列，这是实现 “线程优先” 的核心。
+问：Tomcat 线程池满了会发生什么？答：当线程数到 maxThreads，且队列也满（queueCapacity），会触发拒绝策略，默认是 AbortWithReport：打印拒绝日志（包含请求信息），并抛出 RejectedExecutionException，Tomcat 最终会给客户端返回 503 Service Unavailable。
+总结（面试速记要点）
+核心关系：Tomcat 线程池是 JDK 原生 ThreadPoolExecutor 的子类，复用基础逻辑，核心改造 “任务提交策略”；
+核心差异：原生 “队列优先” 适配通用场景，Tomcat “线程优先” 适配 Web 低延迟场景（核心是 TaskQueue 重写 offer ()）；
+关键参数：Tomcat 的 maxThreads 对应原生 maximumPoolSize，minSpareThreads 对应 corePoolSize，queueCapacity 对应队列容量。
+
+
+
+
+
+
+
+
+
+
+二、Tomcat 线程池execute()方法源码（核心片段）
+Tomcat 的ThreadPoolExecutor继承自 JDK 的ThreadPoolExecutor，并重写了execute()方法，这是拒绝策略触发的核心入口。以下是关键源码（简化后，保留核心逻辑，加面试级注释）：
+java
+运行
+// Tomcat的ThreadPoolExecutor.java
+@Override
+public void execute(Runnable command, long timeout, TimeUnit unit) {
+    // 1. 前置校验：任务不能为空
+    if (command == null) {
+        throw new NullPointerException();
+    }
+
+    // 2. 获取线程池当前状态和线程数（ctl是JDK原生的原子变量，记录状态+线程数）
+    int c = ctl.get();
+
+    // 步骤1：核心线程数未满 → 创建核心线程执行任务
+    if (workerCountOf(c) < corePoolSize) {
+        if (addWorker(command, true)) {
+            return;
+        }
+        c = ctl.get();
+    }
+
+    // 步骤2：核心线程满 → 尝试入队（关键：Tomcat的TaskQueue重写了offer）
+    // isRunning：判断线程池是否处于运行状态
+    if (isRunning(c) && workQueue.offer(command)) {
+        int recheck = ctl.get();
+        // 二次校验：入队后线程池状态变化（如被关闭），则移除任务并触发拒绝
+        if (!isRunning(recheck) && remove(command)) {
+            reject(command); // 触发拒绝策略
+        } else if (workerCountOf(recheck) == 0) {
+            // 无活跃线程时，创建空线程（兜底）
+            addWorker(null, false);
+        }
+    }
+    // 步骤3：入队失败（队列满）→ 尝试创建非核心线程
+    else if (!addWorker(command, false)) {
+        // 🔥 拒绝策略核心触发点：线程数到maxThreads + 队列满 → 执行拒绝逻辑
+        reject(command);
+    }
+}
+
+// 复用JDK的reject方法（Tomcat重写了rejectedExecutionHandler）
+@Override
+protected void reject(Runnable command) {
+    if (handler != null) {
+        // 调用自定义拒绝策略的rejectedExecution方法
+        handler.rejectedExecution(command, this);
+    } else {
+        // 兜底：用JDK原生的AbortPolicy
+        super.reject(command);
+    }
+}
+
+
+
+
+
+
+
+
+
+四、Tomcat 自定义拒绝策略的实现（源码层面）
+Tomcat 默认的拒绝策略是AbortWithReport（而非 JDK 原生的AbortPolicy），它继承自 JDK 的RejectedExecutionHandler，核心源码如下：
+java
+运行
+// AbortWithReport.java
+public class AbortWithReport implements RejectedExecutionHandler {
+    // 日志记录器（核心：比原生多了日志打印）
+    private static final Log log = LogFactory.getLog(AbortWithReport.class);
+    // 拒绝时的提示信息（包含线程池状态，便于排查）
+    private final String message;
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        // 1. 打印ERROR级别日志（核心改造点：原生AbortPolicy无日志）
+        log.error(message + " " + executor.toString());
+        // 2. 打印线程池详细状态（线程数、队列大小等，排查问题关键）
+        log.error("ThreadPoolExecutor state: " +
+                  "corePoolSize=" + executor.getCorePoolSize() +
+                  ", maxPoolSize=" + executor.getMaximumPoolSize() +
+                  ", activeCount=" + executor.getActiveCount() +
+                  ", queueSize=" + executor.getQueue().size());
+        // 3. 抛出原生异常（和JDK AbortPolicy一致）
+        throw new RejectedExecutionException(message, r);
+    }
+}

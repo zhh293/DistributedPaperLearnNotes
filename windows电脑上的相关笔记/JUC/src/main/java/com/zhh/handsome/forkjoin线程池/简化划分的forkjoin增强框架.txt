@@ -1,0 +1,175 @@
+JDK8 引入的Stream 并行流—— 它本质是 ForkJoin 的 “高层封装”，
+核心目标就是解决手动使用 ForkJoin 时 “任务拆分繁琐、代码量大、阈值难调” 的痛点，
+让开发者不用写复杂的RecursiveTask、不用手动拆分任务，只需一行代码就能实现并行计算。
+
+
+一、先明确核心关系：并行流 = ForkJoin 的 “傻瓜式封装”
+首先要记住：Stream 并行流的底层执行引擎就是 ForkJoinPool（默认用 JDK 的ForkJoinPool.commonPool()公共线程池），它把你手动要做的 “任务拆分、阈值设置、线程调度、结果汇总” 全部交给 JDK 框架自动完成 —— 你只需要调用.parallel()，剩下的拆分逻辑全由 JDK 搞定。
+手动 ForkJoin vs 并行流：代码对比（求和 1-10000）
+先看你熟悉的手动 ForkJoin 写法（繁琐）：
+java
+运行
+// 手动ForkJoin：要继承类、写拆分逻辑、定阈值、管理线程池
+class SumTask extends RecursiveTask<Long> {
+    private final long start;
+    private final long end;
+    private static final long THRESHOLD = 1000;
+
+    public SumTask(long start, long end) {
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected Long compute() {
+        if (end - start <= THRESHOLD) {
+            long sum = 0;
+            for (long i = start; i <= end; i++) sum += i;
+            return sum;
+        } else {
+            long mid = (start + end) / 2;
+            SumTask left = new SumTask(start, mid);
+            left.fork();
+            SumTask right = new SumTask(mid + 1, end);
+            return right.compute() + left.join();
+        }
+    }
+}
+
+// 调用：创建线程池、提交任务、关闭线程池
+public static void main(String[] args) {
+    ForkJoinPool pool = new ForkJoinPool();
+    Long result = pool.invoke(new SumTask(1, 10000));
+    System.out.println(result); // 50005000
+    pool.shutdown();
+}
+再看 Stream 并行流写法（极简）：
+java
+运行
+// 并行流：一行代码搞定，无需手动拆分/线程池管理
+public static void main(String[] args) {
+    long result = IntStream.rangeClosed(1, 10000) // 生成1-10000的流
+                           .parallel() // 开启并行（底层自动用ForkJoin）
+                           .asLongStream() // 转Long避免溢出
+                           .sum(); // 求和（自动拆分+汇总）
+    System.out.println(result); // 50005000
+}
+
+
+👉 核心差异：并行流把 “手动拆分任务、写 compute 逻辑、定阈值、管理线程池” 全部省略，框架自动完成 —— 这就是它解决 ForkJoin “任务拆分难题” 的核心。
+二、为什么并行流能解决 “任务拆分难题”？核心是 Spliterator（可分割迭代器）
+手动 ForkJoin 的痛点是 “开发者要自己判断拆分阈值、写拆分逻辑”，而并行流的底层核心是Spliterator（可分割迭代器）—— 它是 JDK8 为集合 / 流设计的 “自动拆分器”，能根据数据源的特性（比如数组 / 链表）自动计算拆分方式和阈值，无需开发者干预。
+1. Spliterator 的核心作用（自动拆分的关键）
+Spliterator翻译为 “可分割的迭代器”，它就像 ForkJoin 的 “智能拆分助手”，主要做 3 件事：
+遍历：遍历数据源的元素（替代普通迭代器）；
+拆分：把当前数据源拆分成多个子数据源（比如把 1-10000 拆成 1-5000、5001-10000）；
+预估大小：预估当前数据源的元素数量，框架根据这个数量自动计算 “拆分阈值”（比如数组大小是 10000，自动拆到每个子任务 1000 个元素）。
+
+
+
+👉 关键：拆分的逻辑（拆成多少份、阈值多少）全由Spliterator和 JDK 框架决定，开发者不用写一行拆分代码。
+三、Stream 并行流的完整使用指南（从基础到进阶）
+并行流的使用核心是 “串行流加.parallel()”，但要注意数据源和操作的选择，以下是高频场景的使用示例：
+场景 1：简单聚合计算（求和、最大值、计数）
+适合 CPU 密集型的简单计算，是并行流最擅长的场景：
+java
+运行
+import java.util.Arrays;
+import java.util.List;
+import java.util.OptionalInt;
+
+public class ParallelStreamDemo {
+    public static void main(String[] args) {
+        // 1. 准备数据源（数组/List都支持）
+        List<Integer> numbers = Arrays.asList(1, 2, 3, ..., 10000); // 1-10000的列表
+
+        // 2. 并行求和
+        long sum = numbers.parallelStream()
+                          .mapToLong(Integer::longValue)
+                          .sum();
+        System.out.println("求和：" + sum); // 50005000
+
+        // 3. 并行找最大值
+        OptionalInt max = numbers.parallelStream()
+                                 .mapToInt(Integer::intValue)
+                                 .max();
+        System.out.println("最大值：" + max.getAsInt()); // 10000
+
+        // 4. 并行计数（过滤后）
+        long count = numbers.parallelStream()
+                            .filter(n -> n % 2 == 0) // 过滤偶数
+                            .count();
+        System.out.println("偶数个数：" + count); // 5000
+    }
+}
+场景 2：复杂操作（过滤 + 映射 + 汇总）
+并行流支持链式操作，框架会自动优化拆分逻辑：
+java
+运行
+// 需求：计算1-10000中偶数的平方和
+long squareSum = IntStream.rangeClosed(1, 10000)
+                          .parallel() // 开启并行
+                          .filter(n -> n % 2 == 0) // 过滤偶数
+                          .mapToLong(n -> (long) n * n) // 平方
+                          .sum(); // 求和
+System.out.println("偶数平方和：" + squareSum); // 结果：166691670000
+场景 3：自定义汇总（Collectors）
+并行流支持Collectors做复杂汇总，框架自动并行化：
+java
+运行
+import java.util.Map;
+import java.util.stream.Collectors;
+
+// 需求：把1-100的数按“奇数/偶数”分组，并行计算每组的和
+Map<String, Long> groupSum = IntStream.rangeClosed(1, 100)
+                                      .parallel()
+                                      .boxed() // 转Integer
+                                      .collect(Collectors.groupingBy(
+                                          n -> n % 2 == 0 ? "偶数" : "奇数", // 分组规则
+                                          Collectors.summingLong(Long::valueOf) // 汇总规则
+                                      ));
+System.out.println(groupSum); // {奇数=2500, 偶数=2550}
+
+
+
+
+五、并行流的注意事项（避坑指南，面试高频）
+并行流虽然简单，但用错了会导致性能差甚至线程安全问题，核心注意点：
+1. 线程安全问题（最容易踩坑）
+并行流的操作中，不能使用非线程安全的集合 / 变量（比如 ArrayList、HashMap、普通 int 变量）：
+java
+运行
+// 错误示例：使用非线程安全的ArrayList存储结果，会出现数据丢失/重复
+List<Integer> result = new ArrayList<>();
+IntStream.rangeClosed(1, 1000).parallel()
+         .forEach(result::add); // 线程不安全！
+System.out.println(result.size()); // 可能≠1000
+
+// 正确示例：使用线程安全的集合，或用collect汇总
+List<Integer> safeResult = IntStream.rangeClosed(1, 1000)
+                                    .parallel()
+                                    .boxed()
+                                    .collect(Collectors.toList()); // 线程安全
+2. 不是所有场景都适合并行（性能陷阱）
+适合：CPU 密集型任务（求和、排序、过滤、映射）、数据源大（万级以上）、数据源易拆分（数组、ArrayList）；
+不适合：IO 密集型任务（文件读写、网络请求）、数据源小（千级以下）、数据源难拆分（LinkedList）—— 并行的开销（线程切换、拆分）会超过并行收益。
+3. 公共线程池（commonPool）的参数调整
+并行流默认使用ForkJoinPool.commonPool()，默认线程数 = CPU 核心数 - 1（比如 4 核 = 3 线程）。如果需要调整：
+java
+运行
+// 方式1：JVM启动参数（全局生效）
+// -Djava.util.concurrent.ForkJoinPool.common.parallelism=8
+
+// 方式2：代码中临时调整（JDK9+支持）
+System.setProperty("java.util.concurrent.ForkJoinPool.common.parallelism", "8");
+4. 避免有状态的操作
+并行流中如果操作依赖 “状态”（比如前一个元素的结果），会导致结果错误：
+java
+运行
+// 错误示例：计算累加和，使用有状态的变量
+int sum = 0;
+IntStream.rangeClosed(1, 100).parallel()
+         .forEach(n -> sum += n); // sum是共享状态，结果错误
+
+// 正确示例：用sum()/reduce()无状态汇总
+long correctSum = IntStream.rangeClosed(1, 100).parallel().sum();

@@ -1,0 +1,226 @@
+最近在学习Sentinel流控效果的时候发现其中的排队等待机制使用了漏桶算法，遂感兴趣前来学习ing
+
+
+一、漏桶算法核心定义（先搞懂 “是什么”）
+漏桶算法（Leaky Bucket）是分布式系统中流量整形 / 限流的经典算法，核心目标是：强制请求以固定速率被处理，即使请求突发到来，也会先排队，再以匀速被处理；若排队满了，多余请求直接拒绝。
+
+
+
+用生活例子彻底理解：
+你往一个有固定大小漏洞的水桶里倒水（请求入桶），水桶下方的漏洞以固定速度漏水（请求被处理）；
+不管你倒水多快（突发请求），漏水速度始终不变（处理速率固定）；
+水倒太快时，水桶会先存水（请求排队），水桶满了之后，再倒的水会溢出（请求被拒绝）。
+
+
+
+分布式场景的适配特点：
+单机漏桶只能控制单实例的流量，而分布式场景下，漏桶算法通常需要中心化实现（比如基于 Redis），确保整个集群的请求都受统一的漏桶控制（避免单实例漏桶导致集群总流量超限）。
+二、漏桶算法核心要素（排队等待的关键）
+漏桶的 “排队” 逻辑完全依赖这 4 个核心要素，缺一不可：
+
+
+桶容量（bucketSize）	水桶最多能装多少水 → 漏桶最多能排队多少个请求	决定排队的上限，超过则拒绝请求
+漏水速率（rate）	每秒漏出多少水 → 系统每秒能处理多少个请求（固定值）	决定排队请求的处理速度，速率越慢，排队越长
+排队队列	存放等待处理的请求（通常用阻塞队列实现）	是 “排队等待” 的物理载体，请求入桶实际就是入队，漏水就是从队列取请求处理
+剩余水量（water）	桶内当前的水量 → 当前排队的请求数（含待处理的）	用于快速判断是否能入桶：剩余水量 < 桶容量 → 可排队；否则 → 拒绝
+
+
+
+
+关键步骤拆解（重点看排队）：
+预漏水：每次收到新请求，先计算 “从上一次处理到现在，漏桶能处理多少请求”（比如上次处理是 1 秒前，漏水速率是 5 个 / 秒 → 能处理 5 个），把这部分 “水量” 从桶里减掉（相当于处理了排队的请求）；
+判断排队空间：预漏水后，若桶内剩余水量 + 当前请求 ≤ 桶容量 → 请求进入队列排队；否则直接拒绝；
+匀速处理：后台线程以固定速率（比如 5 个 / 秒）从队列取请求执行，每执行 1 个，桶内剩余水量减 1，实现 “匀速漏水”。
+四、Java 实现漏桶算法（重点演示排队等待）
+下面提供单机版漏桶算法的完整可运行代码（先理解单机逻辑，再扩展分布式），重点体现 “排队等待” 的实现：
+
+
+
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * 漏桶算法核心实现（单机版）
+ * 重点：用BlockingQueue实现请求排队，ScheduledExecutorService实现固定速率漏水
+ */
+public class LeakyBucket {
+    // 1. 核心配置
+    private final int bucketSize; // 桶容量（最大排队数）
+    private final int rate;       // 漏水速率（每秒处理请求数）
+    private final AtomicInteger water; // 桶内剩余水量（当前排队数）
+    private final BlockingQueue<Runnable> queue; // 排队队列（请求的载体）
+    private final ScheduledExecutorService executor; // 处理请求的线程池（漏水线程）
+    private long lastLeakTime; // 上次漏水的时间戳（用于计算预漏水的量）
+
+    /**
+     * 构造方法初始化漏桶
+     * @param bucketSize 桶容量（最大排队数）
+     * @param rate 漏水速率（每秒处理请求数）
+     */
+    public LeakyBucket(int bucketSize, int rate) {
+        this.bucketSize = bucketSize;
+        this.rate = rate;
+        this.water = new AtomicInteger(0);
+        this.queue = new LinkedBlockingQueue<>(bucketSize); // 队列容量和桶容量一致
+        this.executor = Executors.newSingleThreadScheduledExecutor(); // 单线程匀速处理
+        this.lastLeakTime = System.currentTimeMillis();
+
+        // 启动漏水线程：以固定速率从队列取请求处理（核心！实现匀速漏水）
+        startLeakThread();
+    }
+
+    /**
+     * 启动漏水线程：每隔1/rate秒处理一个请求（比如rate=5，则每200ms处理1个，每秒5个）
+     */
+    private void startLeakThread() {
+        // 计算每次处理的间隔时间（毫秒）：1秒=1000毫秒 / 每秒处理数
+        long interval = 1000 / rate;
+        executor.scheduleAtFixedRate(() -> {
+            // 从队列取请求并执行（漏水）
+            Runnable task = queue.poll();
+            if (task != null) {
+                try {
+                    task.run(); // 执行请求逻辑
+                    water.decrementAndGet(); // 剩余水量-1
+                    System.out.println("【漏水】处理1个请求，当前排队数：" + water.get());
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }, 0, interval, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 请求入桶（核心：排队逻辑）
+     * @param task 要执行的请求（Runnable封装业务逻辑）
+     * @return true=入桶成功（排队/直接处理），false=桶满拒绝
+     */
+    public boolean tryAddTask(Runnable task) {
+        // 第一步：预漏水 → 计算从上一次到现在能处理多少请求，更新剩余水量
+        preLeak();
+
+        // 第二步：判断是否能入桶（排队）
+        if (water.get() < bucketSize) {
+            // 入队成功 → 排队成功
+            boolean addSuccess = queue.offer(task);
+            if (addSuccess) {
+                water.incrementAndGet(); // 剩余水量+1
+                System.out.println("【入桶】请求排队成功，当前排队数：" + water.get());
+                return true;
+            }
+        }
+        // 桶满 → 拒绝请求
+        System.out.println("【拒绝】桶已满，排队数：" + water.get() + "，拒绝请求");
+        return false;
+    }
+
+    /**
+     * 预漏水：计算时间差，更新剩余水量（核心优化：避免实时计算，提升性能）
+     */
+    private void preLeak() {
+        long now = System.currentTimeMillis();
+        // 计算时间差（秒）：注意转成浮点数，避免整数除法丢失精度
+        double timeDiff = (now - lastLeakTime) / 1000.0;
+        // 这段时间能处理的请求数 = 时间差 * 漏水速率
+        int leakNum = (int) (timeDiff * rate);
+
+        if (leakNum > 0) {
+            // 更新剩余水量：最少为0（不能为负）
+            int newWater = Math.max(0, water.get() - leakNum);
+            water.set(newWater);
+            // 更新上次漏水时间
+            lastLeakTime = now;
+            System.out.println("【预漏水】时间差：" + timeDiff + "秒，处理了" + leakNum + "个请求，剩余排队数：" + newWater);
+        }
+    }
+
+    /**
+     * 关闭线程池（避免内存泄漏）
+     */
+    public void shutdown() {
+        executor.shutdown();
+    }
+}
+
+
+
+
+
+
+
+分布式场景下的漏桶算法（扩展）
+上面的单机漏桶只能控制单实例的流量，分布式集群中需要中心化漏桶（避免多实例漏桶导致总流量超限），核心实现思路：
+1. 基于 Redis 的分布式漏桶（核心逻辑）
+用 Redis 的List做排队队列，incr/decr统计剩余水量，Redis sorted set或定时任务实现 “匀速漏水”：
+
+
+
+// 伪代码：分布式漏桶核心逻辑（基于Redis）
+public class DistributedLeakyBucket {
+    private final Jedis jedis;
+    private final String bucketKey; // 队列key
+    private final String waterKey;  // 剩余水量key
+    private final int bucketSize;
+    private final int rate;
+
+    // 请求入桶
+    public boolean tryAddTask(String task) {
+        // 1. 预漏水：Redis计算时间差，更新剩余水量
+        Long lastLeakTime = jedis.get("last_leak_time") == null ? 0 : Long.parseLong(jedis.get("last_leak_time"));
+        long now = System.currentTimeMillis();
+        double timeDiff = (now - lastLeakTime) / 1000.0;
+        int leakNum = (int) (timeDiff * rate);
+        if (leakNum > 0) {
+            jedis.decrBy(waterKey, leakNum); // 剩余水量减
+            jedis.set("last_leak_time", String.valueOf(now));
+        }
+
+        // 2. 判断是否能入队
+        int water = Integer.parseInt(jedis.get(waterKey) == null ? "0" : jedis.get(waterKey));
+        if (water < bucketSize) {
+            jedis.lpush(bucketKey, task); // 入Redis List排队
+            jedis.incr(waterKey); // 剩余水量+1
+            return true;
+        }
+        return false;
+    }
+
+    // 漏水线程：从Redis List取任务处理
+    public void startLeakThread() {
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
+            String task = jedis.rpop(bucketKey); // 取队尾任务
+            if (task != null) {
+                // 处理任务
+                jedis.decr(waterKey);
+            }
+        }, 0, 1000/rate, TimeUnit.MILLISECONDS);
+    }
+}
+
+
+2. 分布式漏桶的优势 & 注意事项
+优势：集群所有实例共用一个漏桶，流量控制更精准；
+注意事项：Redis 的性能是瓶颈（需保证 Redis 高可用），且 “匀速漏水” 的定时任务需做容灾（比如用 Redis 的分布式锁避免多实例重复执行）。
+
+
+
+漏桶算法和我们之前学习的令牌桶算法看起来很像，都是用来做限流处理的，但是这两者还是有不小的差别的，现在我来详细的讲解一下
+
+漏桶算法主要还是针对对于请求处理速率比较严格的场景。而令牌桶则适合突发流量的场景，具体情况具体分析吧
+
+
+
+
+
+
+
+
+
+
+
+
+

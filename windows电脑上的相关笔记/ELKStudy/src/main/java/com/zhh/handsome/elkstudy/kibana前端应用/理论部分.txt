@@ -1,0 +1,160 @@
+纯前端项目集成 Elastic Charts（编码方式，适合前端开发者）
+如果需要在自己的前端项目（React/Vue）中直接实现图表，而非嵌入 Kibana 的 iframe，推荐使用 Elastic 官方的 @elastic/charts 库（Kibana 底层同款），支持 20+ 图表类型，适配 ES 数据格式。
+前置条件
+前端项目（React 优先，Elastic Charts 原生适配 React；Vue 项目可通过封装 React 组件使用）；
+已安装 ES 客户端（可选，用于对接 ES 数据）。
+步骤 1：安装依赖
+bash
+运行
+# 核心图表库
+npm install @elastic/charts --save
+# （可选）ES 客户端，用于前端直接查询 ES 数据
+npm install @elastic/elasticsearch --save
+# 辅助依赖（处理时间格式）
+npm install @elastic/datemath moment --save
+步骤 2：基础示例（React 中实现柱状图 + 饼图）
+tsx
+import React, { useState, useEffect } from 'react';
+import {
+  Chart,
+  BarChart,
+  PieChart,
+  Axis,
+  Series,
+  Tooltip,
+  Legend,
+  useTheme
+} from '@elastic/charts';
+import { Client } from '@elastic/elasticsearch';
+
+// 初始化 ES 客户端（替换为你的 ES 地址和认证信息）
+const esClient = new Client({
+  node: 'http://your-es-server:9200',
+  auth: {
+    username: 'elastic',
+    password: 'your-es-password'
+  }
+});
+
+const ElasticChartsDemo = () => {
+  const theme = useTheme(); // 使用 Elastic 官方主题
+  const [pieData, setPieData] = useState([]); // 饼图数据
+  const [barData, setBarData] = useState([]); // 柱状图数据
+
+  // 从 ES 查询数据
+  const fetchESData = async () => {
+    // 1. 查询饼图数据（商品分类销售额）
+    const pieResponse = await esClient.search({
+      index: 'order_index', // 你的 ES 索引名
+      body: {
+        aggs: {
+          category_sales: {
+            terms: { field: 'product_category.keyword' }, // 分类字段（需为 keyword 类型）
+            aggs: {
+              total_sales: { sum: { field: 'sales_amount' } } // 销售额求和
+            }
+          }
+        },
+        size: 0 // 只需要聚合结果，不需要原始数据
+      }
+    });
+
+    // 处理饼图数据为图表所需格式
+    const pieResult = pieResponse.aggregations.category_sales.buckets.map(bucket => ({
+      category: bucket.key,
+      value: bucket.total_sales.value
+    }));
+
+    // 2. 查询柱状图数据（每日销售额）
+    const barResponse = await esClient.search({
+      index: 'order_index',
+      body: {
+        aggs: {
+          daily_sales: {
+            date_histogram: { field: 'order_time', calendar_interval: 'day' }, // 按天聚合
+            aggs: {
+              total_sales: { sum: { field: 'sales_amount' } }
+            }
+          }
+        },
+        size: 0
+      }
+    });
+
+    // 处理柱状图数据
+    const barResult = barResponse.aggregations.daily_sales.buckets.map(bucket => ({
+      date: bucket.key_as_string,
+      sales: bucket.total_sales.value
+    }));
+
+    // 更新状态，渲染图表
+    setPieData(pieResult);
+    setBarData(barResult);
+  };
+
+  // 组件挂载时获取数据
+  useEffect(() => {
+    fetchESData();
+  }, []);
+
+  return (
+    <div style={{ display: 'flex', gap: '20px', padding: '20px' }}>
+      {/* 柱状图：每日销售额 */}
+      <div style={{ width: '600px', height: '400px' }}>
+        <Chart theme={theme} height={400} width={600}>
+          <BarChart data={barData} xKey="date" yKey="sales" />
+          <Axis type="x" title="日期" />
+          <Axis type="y" title="销售额（元）" />
+          <Tooltip /> {/* 鼠标悬浮提示 */}
+          <Legend /> {/* 图例 */}
+        </Chart>
+      </div>
+
+      {/* 饼图：商品分类销售额占比 */}
+      <div style={{ width: '400px', height: '400px' }}>
+        <Chart theme={theme} height={400} width={400}>
+          <PieChart
+            data={pieData}
+            categoryKey="category" // 分类字段
+            valueKey="value" // 数值字段
+            innerRadius={0.4} // 环形图效果（0 为实心饼图）
+          />
+          <Tooltip />
+          <Legend position="right" />
+        </Chart>
+      </div>
+    </div>
+  );
+};
+
+export default ElasticChartsDemo;
+步骤 3：支持的图表类型
+Elastic Charts 覆盖绝大多数可视化场景，常用类型包括：
+基础类：柱状图、折线图、面积图、饼图、环形图、表格；
+特色类：热力图、散点图、地图（Geo 图表）、仪表盘（Gauge）、桑基图、词云、瀑布图；
+高级类：混合图表（柱状 + 折线）、分面图表（多维度拆分）。
+步骤 4：主题定制（适配前端项目风格）
+如果默认主题不符合项目风格，可自定义主题：
+tsx
+import { createTheme } from '@elastic/charts';
+
+// 自定义主题
+const customTheme = createTheme({
+  colors: ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4'], // 图表颜色
+  font: {
+    family: 'Microsoft YaHei', // 字体
+    size: 14 // 基础字号
+  },
+  background: '#F8F9FA' // 图表背景色
+});
+
+// 使用自定义主题
+<Chart theme={customTheme} height={400} width={600}>
+  {/* 图表内容 */}
+</Chart>
+总结
+核心技术栈：ELK 中实现前端多样化图表的核心是 Kibana（Lens/Canvas），纯前端编码则用 Elastic Charts 库（Kibana 底层同款）；
+使用方式选择：
+快速实现 / 非编码场景：用 Kibana 的 Lens/Canvas 制作，通过 iframe 嵌入前端；
+自定义前端项目：集成 @elastic/charts 库，对接 ES 数据直接渲染；
+数据来源：所有图表的数据源均来自 Elasticsearch 索引，需通过聚合查询（terms/sum/date_histogram 等）处理为图表所需格式。

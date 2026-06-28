@@ -1,0 +1,820 @@
+@MqIdempotent注解，是大厂将 RabbitMQ 幂等性逻辑工程化、通用化、低侵入化的核心实现，本质是 **「Spring 自定义注解 + AOP 切面拦截 + 策略模式」的组合落地 —— 通过注解标记需要做幂等的消费者方法，用 AOP 在方法执行前自动完成「唯一键解析→多级判重→幂等校验」，底层用策略模式封装 Redis/DB/ 业务状态等不同幂等实现，做到业务代码零侵入、幂等策略可配置、扩展可插拔 **。
+全程结合完整可运行源码讲解，基于 Spring Boot+Spring AOP（大厂主流技术栈），代码和阿里 / 美团 / 京东的通用幂等框架思路完全一致，逐行解析核心类，并说明大厂实战的优化细节，小白也能看懂并直接复刻到自己的项目中。
+核心设计思路先明确
+在看源码前，先建立整体认知，这个注解的核心执行流程和设计原则是大厂框架的通用思路：
+1. 核心执行流程（一次消费的完整链路）
+plaintext
+消费者收到消息 → AOP拦截加了@MqIdempotent的方法 → 解析注解配置（幂等类型/过期时间/业务键）→ 解析SpEL表达式获取「业务唯一值」（如消息ID/订单ID）→ 拼接全局幂等Key → 多级判重（本地缓存→Redis→DB）→ 判重通过：执行原消费方法 → 判重失败：直接返回（实现幂等）
+2. 核心设计原则（大厂框架必备）
+低侵入：业务开发只需加注解，无需写任何判重代码，原消费逻辑完全不变；
+可配置：通过注解参数指定幂等策略（Redis/DB）、过期时间、业务唯一键，适配不同业务；
+可扩展：新增幂等策略（如业务状态判重），只需实现接口，无需修改原有代码（开闭原则）；
+高性能：加入本地缓存（Guava Cache），层层过滤重复请求，减少 Redis/DB 的访问压力；
+通用性：支持 SpEL 表达式解析方法参数，适配任意形式的入参（Message / 自定义 DTO / 单个字段）。
+3. 技术栈依赖（全 Spring 生态，无额外重依赖）
+Spring Boot：基础开发框架；
+Spring AOP：核心拦截技术，实现方法无侵入增强；
+Spring SpEL：解析注解中的动态业务键（如#msgId/#message.getMessageProperties().getMessageId()）；
+策略模式 + 工厂模式：封装不同幂等实现，解耦策略选择和具体执行；
+Guava Cache：消费端本地内存缓存，做一级判重；
+Redis/MySQL：底层幂等存储，做二级 / 三级判重（复用之前讲的 SETNX / 唯一索引逻辑）。
+
+
+
+
+第一步：定义核心基础组件（枚举 / 注解）
+先定义幂等类型枚举和自定义 @MqIdempotent 注解，这是框架的「入口」，注解的参数设计完全贴合大厂实战需求，覆盖所有常用配置。
+1. 幂等类型枚举（IdempotentType.java）
+定义支持的幂等策略，后续新增策略只需加枚举值 + 实现接口，符合开闭原则，大厂不会用硬编码的 if-else 判断类型。
+java
+运行
+package com.rabbitmq.idempotent.enums;
+
+/**
+ * 幂等策略类型枚举（大厂实战常用2种，可扩展）
+ */
+public enum IdempotentType {
+    /**
+     * Redis SETNX 实现（高性能，中小高并发首选）
+     */
+    REDIS,
+    /**
+     * 数据库唯一索引 实现（最可靠，和业务强关联场景首选）
+     */
+    DB,
+    /**
+     * 业务状态判重（扩展项，适用于有明确状态的业务，如订单/库存）
+     */
+    BIZ_STATUS
+}
+2. 核心自定义注解（MqIdempotent.java）
+这是业务开发人员唯一需要接触的类，加在 RabbitMQ 消费者方法上即可，每个参数都有明确的实战意义，注释写清用途。
+
+
+
+2. 核心自定义注解（MqIdempotent.java）
+这是业务开发人员唯一需要接触的类，加在 RabbitMQ 消费者方法上即可，每个参数都有明确的实战意义，注释写清用途。
+
+
+package com.rabbitmq.idempotent.annotation;
+
+import com.rabbitmq.idempotent.enums.IdempotentType;
+import java.lang.annotation.*;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * RabbitMQ幂等性核心注解
+ * 加在@RabbitListener标注的消费者方法上，实现无侵入幂等
+ */
+@Target({ElementType.METHOD}) // 仅作用于方法
+@Retention(RetentionPolicy.RUNTIME) // 运行时生效，AOP才能解析
+@Documented // 生成文档
+public @interface MqIdempotent {
+
+    /**
+     * 必选：幂等策略类型（Redis/DB/业务状态）
+     */
+    IdempotentType type();
+
+    /**
+     * 可选：幂等Key的过期时间（Redis/本地缓存用）
+     * 默认3600秒（1小时），建议设为业务最大执行时间的3-5倍
+     */
+    long expire() default 3600L;
+
+    /**
+     * 可选：过期时间单位
+     * 默认秒
+     */
+    TimeUnit timeUnit() default TimeUnit.SECONDS;
+
+    /**
+     * 必选：业务唯一键的SpEL表达式
+     * 用于解析方法参数中的「唯一标识」，如消息ID/订单ID
+     * 示例1：#msgId → 解析方法中名为msgId的参数
+     * 示例2：#message.getMessageProperties().getMessageId() → 解析Message中的消息ID
+     * 示例3：#dto.orderId → 解析自定义DTO中的订单ID
+     */
+    String bizKey();
+
+    /**
+     * 可选：是否开启本地缓存（Guava）
+     * 默认开启，一级判重，高性能
+     */
+    boolean localCache() default true;
+
+    /**
+     * 可选：幂等Key前缀
+     * 避免和其他业务的Key冲突，默认mq:idempotent:
+     */
+    String keyPrefix() default "mq:idempotent:";
+}
+
+
+
+
+第二步：定义策略接口 + 具体实现（策略模式核心）
+这是框架的「核心逻辑层」，用策略模式封装不同的幂等实现，定义统一的IdempotentStrategy接口，所有幂等策略（Redis/DB）都实现该接口，解耦「策略选择」和「具体判重逻辑」。
+1. 幂等策略顶级接口（IdempotentStrategy.java）
+定义统一的幂等判断方法，所有具体实现都必须遵守这个规范，新增策略只需实现该接口，无需修改原有代码。
+
+
+
+package com.rabbitmq.idempotent.strategy;
+
+import com.rabbitmq.idempotent.annotation.MqIdempotent;
+
+/**
+ * 幂等策略顶级接口（策略模式）
+ * 所有幂等实现都需实现此接口
+ */
+public interface IdempotentStrategy {
+
+    /**
+     * 核心幂等判断方法
+     * @param idempotentKey 全局唯一的幂等Key（keyPrefix + 业务唯一值）
+     * @param annotation 注解配置（含过期时间等）
+     * @return true：首次消费（未处理过），false：重复消费（已处理过）
+     */
+    boolean isIdempotent(String idempotentKey, MqIdempotent annotation);
+}
+
+
+
+
+
+
+2. 具体策略实现 1：Redis SETNX 实现（RedisIdempotentStrategy.java）
+复用之前讲的Redis SETNX + 过期时间逻辑，高性能实现，是大厂中小高并发场景的首选，加入了异常降级处理（Redis 宕机时的兜底，大厂必备）。
+
+
+
+
+package com.rabbitmq.idempotent.strategy.impl;
+
+import com.rabbitmq.idempotent.annotation.MqIdempotent;
+import com.rabbitmq.idempotent.enums.IdempotentType;
+import com.rabbitmq.idempotent.strategy.IdempotentStrategy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Component;
+
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Redis SETNX 幂等策略实现（大厂实战主流）
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+// 标记该策略对应的枚举类型，后续工厂类通过枚举获取实例
+public class RedisIdempotentStrategy implements IdempotentStrategy {
+
+    // 注入Redis模板（Spring Boot自动配置）
+    private final StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 核心逻辑：SETNX命令（不存在则设置，存在则返回false）
+     */
+    @Override
+    public boolean isIdempotent(String idempotentKey, MqIdempotent annotation) {
+        try {
+            // 转换过期时间为秒（统一单位，方便Redis操作）
+            long expireSeconds = annotation.timeUnit().toSeconds(annotation.expire());
+            // SETNX核心命令：NX=不存在则设置，EX=过期时间
+            Boolean result = stringRedisTemplate.opsForValue()
+                    .setIfAbsent(idempotentKey, "1", expireSeconds, TimeUnit.SECONDS);
+
+            // result为null：Redis操作异常（如宕机），result为true：首次消费，false：重复消费
+            boolean isFirst = Boolean.TRUE.equals(result);
+            if (isFirst) {
+                log.info("Redis幂等校验通过，首次消费，key：{}", idempotentKey);
+            } else {
+                log.warn("Redis幂等校验失败，重复消费，key：{}", idempotentKey);
+            }
+            return isFirst;
+        } catch (Exception e) {
+            // 大厂必备：Redis宕机时的降级处理（避免整个消费流程挂掉）
+            // 这里可根据业务需求调整：如返回false（拒绝消费）/true（强制消费）/抛异常
+            log.error("Redis幂等校验异常，key：{}，原因：{}", idempotentKey, e.getMessage(), e);
+            // 降级策略：Redis宕机时，默认拒绝消费，避免重复处理
+            return false;
+        }
+    }
+
+    /**
+     * 关联枚举类型（工厂类用）
+     */
+    public IdempotentType getType() {
+        return IdempotentType.REDIS;
+    }
+}
+
+
+
+
+
+
+
+
+
+3. 具体策略实现 2：数据库唯一索引 实现（DbIdempotentStrategy.java）
+复用之前讲的数据库唯一索引插入逻辑，最可靠的幂等实现（持久化存储，不会因缓存失效导致重复），适合和数据库强关联的核心业务（如订单创建、资金扣减），加入事务保证原子性。
+
+
+
+
+
+
+
+package com.rabbitmq.idempotent.strategy.impl;
+
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.rabbitmq.idempotent.annotation.MqIdempotent;
+import com.rabbitmq.idempotent.entity.MqIdempotentDO;
+import com.rabbitmq.idempotent.enums.IdempotentType;
+import com.rabbitmq.idempotent.mapper.MqIdempotentMapper;
+import com.rabbitmq.idempotent.strategy.IdempotentStrategy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+
+/**
+ * 数据库唯一索引 幂等策略实现（大厂核心业务首选，最可靠）
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class DbIdempotentStrategy implements IdempotentStrategy {
+
+    // 注入幂等表Mapper（MyBatis-Plus，简化CRUD）
+    private final MqIdempotentMapper mqIdempotentMapper;
+
+    /**
+     * 核心逻辑：尝试插入幂等表，唯一索引冲突则为重复消费
+     * 加事务：保证插入和业务执行的原子性（若业务执行失败，回滚插入）
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean isIdempotent(String idempotentKey, MqIdempotent annotation) {
+        try {
+            // 构建幂等表实体
+            MqIdempotentDO idempotentDO = new MqIdempotentDO();
+            idempotentDO.setMsgId(idempotentKey); // 幂等Key作为消息唯一ID
+            idempotentDO.setBizType(annotation.keyPrefix()); // 用前缀标识业务类型
+            idempotentDO.setCreateTime(LocalDateTime.now());
+
+            // 尝试插入：唯一索引（msg_id）冲突则抛异常
+            mqIdempotentMapper.insert(idempotentDO);
+            log.info("DB幂等校验通过，首次消费，key：{}", idempotentKey);
+            return true;
+        } catch (Exception e) {
+            // 捕获唯一索引冲突异常（Duplicate entry）
+            if (e.getMessage() != null && (e.getMessage().contains("Duplicate entry") || e.getMessage().contains("uk_msg_id"))) {
+                log.warn("DB幂等校验失败，重复消费，key：{}", idempotentKey);
+                return false;
+            }
+            // 其他异常（如数据库宕机），抛异常由上层处理
+            log.error("DB幂等校验异常，key：{}，原因：{}", idempotentKey, e.getMessage(), e);
+            throw e;
+        }
+    }
+
+    /**
+     * 关联枚举类型
+     */
+    public IdempotentType getType() {
+        return IdempotentType.DB;
+    }
+}
+
+
+
+
+
+
+
+第三步：策略工厂类（工厂模式，选择具体策略）
+实现工厂模式，将「幂等类型枚举」和「具体策略实例」做映射，避免在 AOP 中写大量 if-else 判断类型，是大厂框架的通用优化，初始化时自动加载所有策略，后续新增策略无需修改工厂类。
+
+
+
+package com.rabbitmq.idempotent.factory;
+
+import com.rabbitmq.idempotent.enums.IdempotentType;
+import com.rabbitmq.idempotent.strategy.IdempotentStrategy;
+import com.rabbitmq.idempotent.strategy.impl.BizStatusIdempotentStrategy;
+import com.rabbitmq.idempotent.strategy.impl.DbIdempotentStrategy;
+import com.rabbitmq.idempotent.strategy.impl.RedisIdempotentStrategy;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 幂等策略工厂类（工厂模式）
+ * 根据幂等类型枚举，获取对应的策略实例，避免if-else
+ */
+@Slf4j
+@Component
+public class IdempotentStrategyFactory implements InitializingBean {
+
+    // 存储「枚举类型→策略实例」的映射，EnumMap比HashMap更适合枚举键
+    private static final Map<IdempotentType, IdempotentStrategy> STRATEGY_MAP = new EnumMap<>(IdempotentType.class);
+
+    // 注入所有实现了IdempotentStrategy接口的策略实例（Spring自动扫描）
+    @Autowired
+    private List<IdempotentStrategy> idempotentStrategyList;
+
+    /**
+     * 对外提供的核心方法：根据类型获取策略实例
+     * @param type 幂等类型
+     * @return 对应的策略实例
+     */
+    public static IdempotentStrategy getStrategy(IdempotentType type) {
+        IdempotentStrategy strategy = STRATEGY_MAP.get(type);
+        if (strategy == null) {
+            throw new IllegalArgumentException("不支持的幂等策略类型：" + type);
+        }
+        return strategy;
+    }
+
+    /**
+     * Spring初始化后执行：将所有策略实例放入STRATEGY_MAP
+     * InitializingBean接口：实现afterPropertiesSet方法，在Bean属性注入完成后执行
+     */
+    @Override
+    public void afterPropertiesSet() {
+        // 遍历所有策略实例，根据getType()方法关联枚举类型
+        idempotentStrategyList.forEach(strategy -> {
+            IdempotentType type = null;
+            if (strategy instanceof RedisIdempotentStrategy) {
+                type = ((RedisIdempotentStrategy) strategy).getType();
+            } else if (strategy instanceof DbIdempotentStrategy) {
+                type = ((DbIdempotentStrategy) strategy).getType();
+            } else if (strategy instanceof BizStatusIdempotentStrategy) {
+                type = ((BizStatusIdempotentStrategy) strategy).getType();
+            }
+            if (type != null) {
+                STRATEGY_MAP.put(type, strategy);
+                log.info("幂等策略注册成功：{} → {}", type, strategy.getClass().getSimpleName());
+            }
+        });
+        log.info("所有幂等策略注册完成，共{}种", STRATEGY_MAP.size());
+    }
+}
+
+
+
+
+
+
+第四步：核心工具类（SpEL 解析 + 本地缓存）
+封装两个大厂框架必备的工具类：SpEL 表达式解析工具（解析注解中的bizKey）、Guava 本地缓存工具（一级判重，高性能），工具类做到通用化，可被其他模块复用。
+1. SpEL 表达式解析工具（SpelParseUtil.java）
+核心作用：根据注解中的 SpEL 表达式，从方法参数中解析出「业务唯一值」（如消息 ID / 订单 ID），是实现注解「动态配置业务键」的关键，完全复用 Spring 的 SpEL 解析能力。
+
+
+
+
+package com.rabbitmq.idempotent.util;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.expression.Expression;
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.expression.spel.support.StandardEvaluationContext;
+import org.springframework.stereotype.Component;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+
+/**
+ * SpEL表达式解析工具类
+ * 解析@MqIdempotent注解中的bizKey，获取方法参数中的唯一值
+ */
+@Slf4j
+@Component
+public class SpelParseUtil {
+
+    // Spring SpEL解析器（全局单例）
+    private static final ExpressionParser PARSER = new SpelExpressionParser();
+
+    /**
+     * 解析SpEL表达式，获取业务唯一值
+     * @param method 目标方法（消费者方法）
+     * @param args 方法参数数组
+     * @param spelExpression SpEL表达式（如#message.getMessageProperties().getMessageId()）
+     * @return 解析后的业务唯一值（字符串）
+     */
+    public String parse(Method method, Object[] args, String spelExpression) {
+        try {
+            // 1. 创建SpEL评估上下文
+            StandardEvaluationContext context = new StandardEvaluationContext();
+            // 2. 获取方法的所有参数
+            Parameter[] parameters = method.getParameters();
+            // 3. 将「参数名→参数值」放入上下文，支持通过#参数名解析
+            for (int i = 0; i < parameters.length; i++) {
+                context.setVariable(parameters[i].getName(), args[i]);
+            }
+            // 4. 解析SpEL表达式
+            Expression expression = PARSER.parseExpression(spelExpression);
+            Object value = expression.getValue(context);
+            // 5. 转换为字符串（幂等Key必须是字符串）
+            if (value == null) {
+                throw new IllegalArgumentException("SpEL表达式解析结果为null，表达式：" + spelExpression);
+            }
+            String bizValue = value.toString();
+            log.info("SpEL表达式解析成功，表达式：{} → 结果：{}", spelExpression, bizValue);
+            return bizValue;
+        } catch (Exception e) {
+            log.error("SpEL表达式解析失败，表达式：{}，方法：{}", spelExpression, method.getName(), e);
+            throw new RuntimeException("SpEL表达式解析失败", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+2. Guava 本地缓存工具（LocalCacheUtil.java）
+实现消费端一级本地判重，内存缓存比 Redis 快 100 倍以上，大幅减少 Redis/DB 的访问压力，大厂会配置合理的最大容量和过期时间，避免内存溢出。
+java
+运行
+package com.rabbitmq.idempotent.util;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Guava本地缓存工具类（幂等一级判重）
+ * 大厂实战：本地缓存 → Redis → DB，三级判重
+ */
+@Slf4j
+@Component
+public class LocalCacheUtil {
+
+    // 全局本地缓存实例，存储已处理的幂等Key
+    private static final Cache<String, Boolean> IDEMPOTENT_CACHE;
+
+    // 静态代码块初始化缓存（大厂常用配置）
+    static {
+        IDEMPOTENT_CACHE = CacheBuilder.newBuilder()
+                .maximumSize(100000) // 最大容量：10万条（根据服务器内存调整）
+                .expireAfterWrite(1, TimeUnit.HOURS) // 写入后1小时过期（和Redis过期时间一致）
+                .concurrencyLevel(16) // 并发级别：16（和CPU核心数匹配）
+                .recordStats() // 开启统计（监控缓存命中率，大厂必备）
+                .build();
+        log.info("Guava本地幂等缓存初始化完成，最大容量：10万，过期时间：1小时");
+    }
+
+    /**
+     * 判断Key是否在本地缓存中（是否已处理）
+     * @param key 幂等Key
+     * @return true：已存在（重复消费），false：不存在（首次消费）
+     */
+    public boolean containsKey(String key) {
+        return IDEMPOTENT_CACHE.getIfPresent(key) != null;
+    }
+
+    /**
+     * 将Key放入本地缓存（标记为已处理）
+     * @param key 幂等Key
+     * @param expire 过期时间
+     * @param timeUnit 过期时间单位
+     */
+    public void put(String key, long expire, TimeUnit timeUnit) {
+        IDEMPOTENT_CACHE.put(key, true);
+        // 可选：手动设置过期时间（Guava默认是写入后过期，此处简化）
+        // 若需精准过期，可使用expireAfterAccess或自定义定时清理
+    }
+
+    /**
+     * 移除缓存Key（异常时回滚）
+     * @param key 幂等Key
+     */
+    public void remove(String key) {
+        IDEMPOTENT_CACHE.invalidate(key);
+    }
+
+    /**
+     * 获取缓存统计信息（大厂监控必备）
+     * @return 命中率、加载数等
+     */
+    public String getStats() {
+        return IDEMPOTENT_CACHE.stats().toString();
+    }
+}
+第五步：核心 AOP 切面（MqIdempotentAspect.java）
+整个注解框架的核心入口，所有幂等逻辑的执行都在这个切面中完成，通过环绕通知拦截加了@MqIdempotent的方法，按「解析注解→解析 SpEL→拼接 Key→多级判重→执行方法」的流程执行，逐行解析核心逻辑，加入大厂实战的日志、监控、异常处理。
+java
+运行
+package com.rabbitmq.idempotent.aspect;
+
+import com.rabbitmq.idempotent.annotation.MqIdempotent;
+import com.rabbitmq.idempotent.factory.IdempotentStrategyFactory;
+import com.rabbitmq.idempotent.strategy.IdempotentStrategy;
+import com.rabbitmq.idempotent.util.LocalCacheUtil;
+import com.rabbitmq.idempotent.util.SpelParseUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Pointcut;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.stereotype.Component;
+
+import java.lang.reflect.Method;
+
+/**
+ * RabbitMQ幂等注解核心切面（AOP）
+ * 环绕通知拦截加了@MqIdempotent的方法，执行幂等逻辑
+ */
+@Slf4j
+@Aspect
+@Component
+@RequiredArgsConstructor
+public class MqIdempotentAspect {
+
+    // 注入SpEL解析工具
+    private final SpelParseUtil spelParseUtil;
+    // 注入本地缓存工具
+    private final LocalCacheUtil localCacheUtil;
+
+    /**
+     * 定义切点：拦截所有加了@MqIdempotent注解的方法
+     * 精准匹配，只拦截需要幂等的方法，减少性能损耗
+     */
+    @Pointcut("@annotation(com.rabbitmq.idempotent.annotation.MqIdempotent)")
+    public void mqIdempotentPointcut() {
+    }
+
+    /**
+     * 环绕通知：核心执行逻辑，在方法执行前做幂等校验
+     * ProceedingJoinPoint：可控制方法是否执行
+     */
+    @Around("mqIdempotentPointcut()")
+    public Object around(ProceedingJoinPoint joinPoint) throws Throwable {
+        // ======================================
+        // 步骤1：获取目标方法、注解配置、方法参数
+        // ======================================
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        Method targetMethod = signature.getMethod(); // 目标消费者方法
+        MqIdempotent annotation = targetMethod.getAnnotation(MqIdempotent.class); // 注解配置
+        Object[] methodArgs = joinPoint.getArgs(); // 方法参数数组
+        log.info("开始执行MQ幂等校验，方法：{}", targetMethod.getName());
+
+        // ======================================
+        // 步骤2：解析SpEL表达式，获取业务唯一值
+        // ======================================
+        String bizValue = spelParseUtil.parse(targetMethod, methodArgs, annotation.bizKey());
+        if (bizValue == null || bizValue.trim().isEmpty()) {
+            throw new IllegalArgumentException("业务唯一值解析为空，方法：" + targetMethod.getName());
+        }
+
+        // ======================================
+        // 步骤3：拼接全局唯一的幂等Key（前缀+业务唯一值）
+        // ======================================
+        String idempotentKey = annotation.keyPrefix() + bizValue;
+        log.info("MQ幂等校验，拼接全局Key：{}", idempotentKey);
+
+        // ======================================
+        // 步骤4：一级判重：本地缓存（Guava），高性能
+        // ======================================
+        if (annotation.localCache()) {
+            if (localCacheUtil.containsKey(idempotentKey)) {
+                log.warn("本地缓存幂等校验失败，重复消费，方法：{}，key：{}", targetMethod.getName(), idempotentKey);
+                return null; // 重复消费，直接返回，不执行原方法
+            }
+        }
+
+        // ======================================
+        // 步骤5：二级判重：策略模式执行幂等校验（Redis/DB/业务状态）
+        // ======================================
+        IdempotentStrategy strategy = IdempotentStrategyFactory.getStrategy(annotation.type());
+        // 执行核心幂等判断：true=首次消费，false=重复消费
+        boolean isFirstConsume = strategy.isIdempotent(idempotentKey, annotation);
+        if (!isFirstConsume) {
+            return null; // 重复消费，直接返回
+        }
+
+        // ======================================
+        // 步骤6：首次消费，将Key放入本地缓存（标记为已处理）
+        // ======================================
+        if (annotation.localCache()) {
+            localCacheUtil.put(idempotentKey, annotation.expire(), annotation.timeUnit());
+            log.info("本地缓存写入幂等Key：{}", idempotentKey);
+        }
+
+        // ======================================
+        // 步骤7：执行原消费者方法，完成业务逻辑
+        // ======================================
+        try {
+            Object result = joinPoint.proceed(methodArgs); // 执行原方法
+            log.info("MQ消费成功，幂等校验通过，方法：{}，key：{}", targetMethod.getName(), idempotentKey);
+            return result;
+        } catch (Throwable e) {
+            // 大厂必备：业务执行失败，回滚幂等标记（移除本地缓存+删除Redis/DB记录）
+            log.error("MQ消费失败，回滚幂等标记，方法：{}，key：{}，原因：{}", targetMethod.getName(), idempotentKey, e.getMessage(), e);
+            // 移除本地缓存
+            if (annotation.localCache()) {
+                localCacheUtil.remove(idempotentKey);
+            }
+            // 若为DB策略，可在此处删除幂等表记录；Redis策略可删除Key（根据业务需求）
+            throw e; // 抛异常，让RabbitMQ处理（如丢入死信队列）
+        }
+    }
+}
+第六步：大厂实战使用示例（零侵入，一行注解搞定）
+所有框架代码写完后，业务开发人员的使用方式极其简单，只需在 RabbitMQ 消费者方法上加@MqIdempotent注解，指定配置即可，原消费逻辑完全不变，这就是大厂框架的「低侵入性」核心优势。
+1. 基础配置（application.yml）
+配置 RabbitMQ/Redis/MySQL 的基础信息，和之前的入门配置一致，无需额外配置框架（Spring 自动扫描注解和 Bean）。
+yaml
+spring:
+  rabbitmq:
+    host: 127.0.0.1
+    port: 5672
+    username: guest
+    password: guest
+    listener:
+      simple:
+        acknowledge-mode: manual # 必开手动ACK
+        concurrency: 5
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: ''
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/rabbitmq_demo?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+    username: root
+    password: root
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.rabbitmq.idempotent.entity
+  configuration:
+    map-underscore-to-camel-case: true
+2. 生产者（正常发送消息，带唯一 ID）
+生产者正常生成全局唯一 ID（雪花算法 / UUID），放入消息的messageId属性，无需任何修改，和普通生产逻辑一致。
+java
+运行
+package com.rabbitmq.idempotent.producer;
+
+import cn.hutool.core.lang.Snowflake;
+import cn.hutool.core.util.IdUtil;
+import com.rabbitmq.idempotent.config.RabbitConfig;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.stereotype.Service;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class MqProducer {
+
+    private final RabbitTemplate rabbitTemplate;
+    // 雪花算法生成唯一ID（大厂首选，替换UUID）
+    private final Snowflake snowflake = IdUtil.getSnowflake(1, 1);
+
+    /**
+     * 发送扣库存消息，带全局唯一ID
+     */
+    public void sendDeductStockMsg(String productId, Integer num) {
+        // 1. 雪花算法生成全局唯一消息ID
+        long msgId = snowflake.nextId();
+        String msgContent = "扣减商品" + productId + "库存" + num + "件";
+        log.info("生产者发送消息，msgId：{}，内容：{}", msgId, msgContent);
+
+        // 2. 发送消息，将msgId放入messageId属性
+        rabbitTemplate.convertAndSend(
+                RabbitConfig.DEDUCT_STOCK_QUEUE,
+                msgContent,
+                message -> {
+                    message.getMessageProperties().setMessageId(String.valueOf(msgId));
+                    return message;
+                }
+        );
+    }
+}
+3. 消费者（核心：加一行 @MqIdempotent 注解）
+这是最关键的部分，原消费逻辑完全不变，只需加注解并指定配置，即可实现幂等，对比之前的入门方案，业务代码完全脱离了幂等判重逻辑。
+java
+运行
+package com.rabbitmq.idempotent.consumer;
+
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.idempotent.annotation.MqIdempotent;
+import com.rabbitmq.idempotent.config.RabbitConfig;
+import com.rabbitmq.idempotent.enums.IdempotentType;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+
+/**
+ * 扣库存消费者（大厂实战使用示例）
+ * 只需加@MqIdempotent注解，零侵入实现幂等
+ */
+@Slf4j
+@Component
+public class DeductStockConsumer {
+
+    /**
+     * 核心：加@MqIdempotent注解，指定幂等配置
+     * type = REDIS：使用Redis SETNX策略
+     * bizKey = #message.getMessageProperties().getMessageId()：SpEL解析Message中的消息ID
+     * expire = 1800：过期时间1800秒（30分钟）
+     */
+    @MqIdempotent(
+            type = IdempotentType.REDIS,
+            bizKey = "#message.getMessageProperties().getMessageId()",
+            expire = 1800
+    )
+    @RabbitListener(queues = RabbitConfig.DEDUCT_STOCK_QUEUE)
+    public void consume(Message message, Channel channel) throws IOException {
+        // 原消费逻辑：完全不变，无需任何幂等判重代码
+        String msgContent = new String(message.getBody());
+        long deliveryTag = message.getMessageProperties().getDeliveryTag();
+        log.info("消费者执行核心业务：{}", msgContent);
+
+        // 模拟扣库存业务（真实场景替换为实际业务代码）
+        // deductStockService.deduct(productId, num);
+
+        // 业务执行成功，手动发送ACK（必做）
+        channel.basicAck(deliveryTag, false);
+        log.info("消费者消费成功，已发送ACK");
+    }
+}
+4. 队列配置（RabbitConfig.java）
+简单的队列配置，持久化保证 MQ 宕机后队列不丢失。
+java
+运行
+package com.rabbitmq.idempotent.config;
+
+import org.springframework.amqp.core.Queue;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class RabbitConfig {
+    // 扣库存队列
+    public static final String DEDUCT_STOCK_QUEUE = "deduct_stock_queue";
+
+    @Bean
+    public Queue deductStockQueue() {
+        // durable: true 持久化，exclusive: false 非独占，autoDelete: false 不自动删除
+        return new Queue(DEDUCT_STOCK_QUEUE, true, false, false);
+    }
+}
+第七步：大厂实战的优化 & 扩展细节（必看）
+以上源码是大厂通用框架的核心实现，实际落地时，大厂会根据自身业务做优化和扩展，这些细节是区分「入门框架」和「大厂实战框架」的关键，也是你后续优化的方向：
+1. 监控埋点（大厂必备）
+在 AOP 切面和策略实现中加入监控指标（如 Prometheus/Grafana），统计：
+幂等校验总次数、成功次数、失败次数；
+本地缓存命中率、Redis/DB 访问次数；
+重复消费率（重复消费次数 / 总消费次数）；
+核心指标超过阈值时触发报警（钉钉 / 短信 / 企业微信）。
+2. 异常降级 & 容错
+Redis 宕机降级：Redis 策略中，若 Redis 操作异常，可降级为「DB 策略」或「本地缓存 + 定时校验」，避免整个消费流程挂掉；
+DB 宕机处理：DB 策略中，若数据库异常，抛异常并将消息丢入死信队列，避免重复重试导致数据库压力过大；
+空值处理：SpEL 解析结果为空、幂等 Key 拼接失败时，直接拒绝消费，丢入死信队列。
+3. 性能优化
+批量操作：高并发下，本地缓存的写入 / 移除可做批量处理，减少锁竞争；
+Redis 管道：Redis 策略中，若需执行多个命令（如 SETNX+EXPIRE），用 Redis 管道（Pipeline）减少网络交互；
+缓存预热：启动时将历史已处理的幂等 Key 预热到本地缓存，减少首次消费的 Redis/DB 访问。
+4. 扩展能力
+自定义幂等 Key 生成器：允许业务开发人员自定义 Key 生成规则，实现KeyGenerator接口即可；
+多维度业务键：支持多个 SpEL 表达式拼接业务键（如#productId + '_' + #orderId），适配复杂业务；
+分布式本地缓存：将 Guava Cache 替换为 Caffeine/Redisson 本地缓存，支持分布式缓存同步。
+5. 数据清理
+Redis 过期策略：合理设置过期时间，避免 Redis 内存溢出，大厂会用「惰性删除 + 定期删除」结合；
+DB 定时清理：幂等表中的数据是冷数据，大厂会写定时任务（如每天凌晨）清理超过 7 天的历史数据，避免数据库表过大；
+本地缓存清理：Guava Cache 配置自动过期，同时开启统计，根据命中率调整最大容量。
+6. 事务一致性
+Redis + 业务事务：用 Lua 脚本将「Redis SETNX」和「业务操作」封装为原子操作，避免「SETNX 成功但业务执行失败」；
+DB 幂等表 + 业务表：将幂等表插入和业务操作放在同一个事务中，保证原子性（如本文 DB 策略的@Transactional）。

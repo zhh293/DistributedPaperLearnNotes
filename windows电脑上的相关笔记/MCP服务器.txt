@@ -1,0 +1,237 @@
+这一天研究了一下MCP服务器，当然，七月份在我听网课的时候我就已经学这个东西了，而最初了解到它甚至可以追溯到四月份
+
+而我写这篇文章的目的就是仔细分享一下MCP的原理和它的配置
+
+MCP，全称为ModelContextProtocol，意为模型上下文协议，而MCP服务器可以是可以是python项目，springboot项目，可以是任何语言开发的服务
+
+它的具体流程是这样的，
+
+
+1. 第一步：客户端加载本地配置（先明确 “怎么找服务端”）
+客户端启动后，会先读取本地的 mcp-client-config.json（这是你提到的 “告知客户端怎么访问服务端” 的关键文件）。该文件里会包含「服务端地址的核心信息」，比如：
+SSE 长连接端点地址（例：http://mcp-server:8080/sse/connect）；
+消息通信端点（MCP-message-endpoint）地址（例：http://mcp-server:8080/mcp/message）；
+连接超时时间、重试次数、客户端标识前缀等基础配置。
+作用：这一步是 “通信前的准备”—— 客户端必须先通过这个配置知道 “服务端的 SSE 端口在哪、消息发送端口在哪”，否则后续的连接和请求都无从谈起。
+
+
+
+2. 第二步：建立 SSE 长连接（打通 “服务端推消息的通道”）
+客户端根据mcp-client-config.json中的 SSE 端点地址，发送一个 GET 请求 到服务端的 SSE 端点（如/sse/connect）。
+SSE（Server-Sent Events，服务器推送事件）的核心作用是：建立一条「服务端→客户端」的单向长连接，用于服务端主动向客户端推送 “确认信息”“状态通知” 等（客户端向服务端发消息仍需用 POST，所以是 “半双工” 通信）。
+此时仅完成 “长连接通道建立”，但服务端还未确认客户端的身份 / 能力，客户端也未告知服务端 “我要开始初始化了”。
+
+
+3. 第三步：客户端发送 “初始化 + 连接确认” 的 JSON（告知服务端 “我是谁、我准备好了”）
+SSE 长连接建立后，客户端会通过 POST 请求 向「MCP-message-endpoint」（消息端点）发送两个关键 JSON 文件（顺序通常有要求）：
+① 初始化 JSON 文件（例：init-config.json）：内容通常是「客户端身份与能力声明」，比如：客户端唯一 ID（clientId: "device-001"）、支持的 MCP 协议版本（protocolVersion: "v2.1"）、客户端类型（如 “设备端 / 应用端”）、需要订阅的服务类型（如 “数据上报 / 指令接收”）。作用：让服务端 “认识客户端”—— 确认客户端的合法性、支持的功能，避免非法客户端接入。
+② 连接已建立 JSON 文件（例：connect-ack.json）：内容相对简单，通常是「客户端告知服务端 “我的 SSE 长连接已通”」，比如：{"status": "sse_connected", "clientId": "device-001", "timestamp": 1699999999999}。作用：让服务端知道 “客户端的长连接通道已就绪，可以往这个通道推确认信息了”。
+
+
+
+4. 第四步：服务端验证与 SSE 响应（确认 “双向通道彻底通了”）
+服务端收到客户端的两个 POST 请求后，会做两件事：
+验证合法性：检查初始化 JSON 中的clientId是否在白名单、协议版本是否兼容、SSE 长连接是否真的已为该clientId建立；
+推送确认信息：如果验证通过，服务端会通过「第二步建立的 SSE 长连接」，将这两个 JSON 文件的 “确认结果” 推回给客户端（比如推回{"init_ack": "success", "connect_ack": "success"}，或直接返回客户端发送的原始 JSON 并标记 “已接收”）。
+关键判断点：只有当客户端通过 SSE 通道收到服务端的 “双确认”（初始化确认 + 连接确认），才算「连接彻底建立」—— 少任何一个确认，都可能意味着通道不完整（比如 SSE 通了但 POST 没到，或 POST 到了但 SSE 推不回）。
+
+
+
+
+
+5. 第五步：正式通信（客户端调用服务 / 上报数据）
+连接彻底建立后，客户端就可以通过「MCP-message-endpoint」（消息端点）发送业务层面的请求了，通过post请求来调用接口和功能，哈哈哈哈哈哈哈哈，问题来了，客户端传递的http请求里面的数据格式怎么确定的，ai怎么知道需要哪些参数的，ai提取出来之后又是怎么填入请求体中的呢，这都是未解之谜，但是呢，无所谓了，知道怎么配置就行了。。。。。。。。。结束。。。。。
+
+
+
+
+然后的话mcp-client-config这个文件会很有讲究，里面不仅要配置服务器地址，更要进行本地资源和环境的配置，打个比方：
+
+command在配置文件中通常不是指 “客户端向云端发送的指令”，而是客户端启动 / 运行过程中需要自动执行的本地命令。比如：
+客户端启动时，可能需要先运行一个脚本（./pre-start.sh）初始化本地资源（如加载证书、创建缓存目录），再连接云端服务器；
+
+env通常用于定义客户端运行时依赖的本地环境变量，这些变量不直接参与 “与云端的网络交互”，但会影响客户端自身的功能逻辑。比如：
+日志相关：LOG_LEVEL=info（控制客户端本地日志的输出级别）、LOG_PATH=/var/log/mcp-client/（指定本地日志存储路径）；
+资源限制：MAX_MEMORY=512M（客户端进程的最大内存限制）、THREAD_COUNT=4（处理本地任务的线程数）；
+
+
+关于这个客户端是谁，怎么写，我只能说现在AI的app这么发达，基本每个ai平台都有添加mcp服务器的地方，我们只需要把重点放在配置文件的编写和服务器的编写上就可以了，字段的解析之类的不用我们操心，那些平台就是一个个客户端。你要是自己的本地编写的一些项目使用mcp，那完全没要考虑什么客户端，引入一个@Tool注解，写一段工具类，加到AI的bean对象里面就行了。说白了，那些所谓的MCP市场，就是把一个个由@Tool修饰的工具类部署到了云服务器上面供ai使用者使用罢了，用来增强自己app上ai的功能。只不过多了一些权限控制和认证。。（需要配置在config文件里面）
+
+
+
+{
+  "mcpServers": {
+    "firecrawl-mcp": {
+      "command": "npx",
+      "args": ["-y", "firecrawl-mcp"],
+      "env": {
+        "FIRECRAWL_API_KEY": "YOUR-API-KEY"
+      }
+    }
+  }
+}
+这是一个爬虫mcp服务器，可以让ai使用它爬取网页
+客户端启动时，初始化模块会解析这个 JSON，将mcpServers.firecrawl-mcp下的字段加载为内存中的 “服务配置对象”，并分发给对应的执行模块：
+command与args：被传递给「命令执行模块」，用于启动本地进程。这里的"command": "npx"和"args": ["-y", "firecrawl-mcp"]组合起来，其实是一条本地命令：npx -y firecrawl-mcp（npx是 Node.js 的包执行工具，作用是临时安装并运行firecrawl-mcp这个包）。客户端会在启动后自动执行这条命令，目的是在本地启动一个与 firecrawl-mcp 配套的代理 / 适配器进程（通常是因为 firecrawl 的核心功能需要本地进程作为中间层，再与云端 MCP 服务器通信）。
+env：被传递给「环境管理模块」，用于设置本地进程的环境变量。这里的"FIRECRAWL_API_KEY": "YOUR-API-KEY"会被注入到上述firecrawl-mcp进程的运行环境中，作为该进程访问 Firecrawl 官方 API（可能是一个网页爬取 / 数据提取服务）的认证凭证。
+
+
+
+全过程就是：
+客户端读取配置，识别到需要执行 npx -y firecrawl-mcp；
+npx 自动下载 firecrawl-mcp 包（临时文件，用完不残留），并跳过确认弹窗；
+启动 firecrawl-mcp 代理进程，同时把 FIRECRAWL_API_KEY 注入到这个进程的运行环境中；
+代理进程用注入的 API Key 连接 Firecrawl 云端服务器，完成认证；
+代理进程在本地待命，供后续其他服务 / 功能调用（比如本地应用要爬取网页时，不用直接连云端，而是通过这个本地代理转发请求，避免直接暴露 API Key 或处理复杂的云端通信逻辑）。
+
+
+第四步具体流程是这样的：
+
+建立长连接
+MCP 协议一般基于长连接（如 WebSocket 或 TCP 长连接）设计，目的是为了：
+减少频繁建立连接的开销（尤其适合需要持续数据交互的场景，比如实时任务状态同步、批量爬取指令下发等）；
+支持服务器主动向代理推送消息（比如爬取任务的进度更新、紧急中断信号等）。
+因此，代理启动后会首先与 Firecrawl 云端的 MCP 服务器建立长连接，保持通信通道的持续性。
+
+发送初始化数据
+（通常是 JSON 格式）连接建立后，代理进程会向服务器发送初始化帧（Initialization Frame），内容通常以 JSON 格式封装，可能包含：
+代理自身的基本信息（如进程 ID、版本号、运行环境等）；
+能力声明（比如支持的爬取模式、数据提取格式、最大并发量等）；
+认证后的会话标识（确认 API Key 已通过验证，建立上下文关联）。
+服务器收到初始化 JSON 后，会返回确认信息，完成 "握手" 流程，之后双方才进入正常的业务数据交互阶段（比如代理接收爬取任务、上传结果等）。
+简单说，MCP 协议的核心就是通过长连接 + 结构化数据（JSON） 实现高效、实时的中间层通信
+
+
+
+
+
+所以简单说，MCP 市场就是 “AI 的应用商店”，@Tool工具类是 “商店里的 APP”，云服务器是 “APP 运行的机房”，而 MCP 协议就是 “手机（AI 应用）和应用商店之间的通信语言”—— 最终目的都是让 AI 能低成本、标准化地用上各种具体功能，从 “只会聊天” 变成 “能做事”。
+
+
+说了这么多，教大家写一个mcp服务器并且使用在AI上面吧。首先要编写MCP服务器，我这里写了一个特别简单的天气MCP。代码就不写了
+
+写一下必要的配置
+
+
+记得注入ToolCallBackProvider
+ @Bean
+    public ToolCallbackProvider getToolCallbackProvider(WeatherTool weatherService) {
+        return MethodToolCallbackProvider.builder().toolObjects(weatherService).build();
+    }
+
+
+
+然后
+application.properties
+
+下面这样写
+
+spring.application.name=McpServer
+
+#spring.ai.openai.base-url=https://ai.nengyongai.cn
+#spring.ai.openai.api-key=sk-XwqqE4PPerJzvDvRryMq10D3q2q3Gaoq8yX6bHyck4Jf1CCJ
+
+spring.ai.mcp.server.name=mcp-server
+spring.ai.mcp.server.version=1.0.0
+spring.ai.mcp.server.enabled= true
+spring.ai.mcp.server.sse-endpoint=/sse
+spring.ai.mcp.server.sse-message-endpoint=/mcp/message
+
+spring.ai.mcp.server.capabilities.tool= true
+server.port=8081
+logging.level.io.modelcontextprotocol=trace
+logging.level.io.micrometer=trace
+
+
+
+
+
+pom文件这么写
+
+
+ <properties>
+        <java.version>21</java.version>
+        <spring-ai.version>1.0.0</spring-ai.version>
+    </properties>
+    <dependencies>
+
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpclient</artifactId>
+            <version>4.5.14</version>
+        </dependency>
+       <!-- <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-openai-spring-boot-starter</artifactId>
+        </dependency>-->
+
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
+            <version>2.0.53</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+    </dependencies>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+
+写完测试之后，打包部署到云服务器上，确定域名并且启动后端项目，开放端口，打开11.6版本以上的postman，选择MCP测试选项，选择http，输入后端地址/sse，connect，应该能显示出来工具有哪些了，测试完之后，换成ai选项，tool栏中配置你的mcp服务器，连上之后打开config按钮，copy下来整段配置文件，随便一个ai平台，找到它的mcp配置地方，把mcp-client-config换成你复制的那一段，应该能正常显示并且使用了。。。。。
+
+
+
+
+
+
+
+
+
+
+重要的补充！！！！！！！！
+MCP 注册时，客户端还没开始建立连接；“系统读配置” 是 MCP 主动上报给注册中心的过程，和客户端后续的连接动作是分离的两个阶段。
+
+
+
+
+
+
+
+
+
+
+

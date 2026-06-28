@@ -1,0 +1,87 @@
+git commit （暂存区 --> 本地仓库）
+3.3.1、* 查看修改的状态（status）
+作用：查看的修改的状态（暂存区、工作区）
+命令形式：git status
+3.3.2、* 添加工作区到暂存区 (add)
+作用：添加工作区一个或多个文件的修改到暂存区
+命令形式：git add 单个文件名 | 通配符
+将所有修改加入暂存区：git add .
+3.3.3、* 提交暂存区到本地仓库 (commit)
+作用：提交暂存区内容到本地仓库的当前分支
+命令形式：git commit -m ' 注释内容 '
+3.3.4、* 查看提交日志 (log)
+在 3.1.3 中配置的别名 git - log 就包含了这些参数，所以后续可以直接使用指令 git - log
+作用：查看提交记录
+命令形式: git log [option]
+options
+--all 显示所有分支
+--pretty=oneline 将提交信息显示为一行
+--abbrev - commit 使得输出的 commitid 更简短
+--graph 以图的形式显示
+3.3.5、版本回退
+作用：版本切换
+命令形式: git reset --hard commitID
+commitID 可以使用 git - log 或 git log 指令查看
+如何查看已经删除的记录？
+git reflog
+这个指令可以看到已经删除的提交记录
+3.3.6、添加文件至忽略列表
+一般我们总会有些文件无需纳入 Git 的管理，也不希望它们总出现在未跟踪文件列表。通常都是些自动生成的文件，比如日志文件，或者编译过程中创建的临时文件等。在这种情况下，我们可以在工作目录中创建一个名为.gitignore 的文件（文件名称固定），列出要忽略的文件模式。下面是一个示例：
+plaintext
+# no .a files
+*.a
+# but do track lib.a, even though you're ignoring .a files above
+!lib.a
+# only ignore the TODO file in the current directory, not subdir/TODO
+/TODO
+# ignore all files in the build/ directory
+build/
+# ignore doc/notes.txt, but not doc/server/arch.txt
+doc/*.txt
+# ignore all .pdf files in the doc/ directory
+doc/**/*.pdf
+
+3.4、分支
+几乎所有的版本控制系统都以某种形式支持分支。使用分支意味着你可以把你的工作从开发主线上分离开来进行重大的 Bug 修改、开发新的功能，以免影响开发主线。
+3.4.1、查看本地分支
+命令：git branch
+3.4.2、创建本地分支
+命令：git branch 分支名
+3.4.4、* 切换分支 (checkout)
+命令：git checkout 分支名
+我们还可以直接切换到一个不存在的分支（创建并切换）
+命令：git checkout -b 分支名
+3.4.6、* 合并分支 (merge)
+一个分支上的提交可以合并到另一个分支
+命令：git merge 分支名称
+3.4.7、删除分支
+不能删除当前分支，只能删除其他分支
+git branch -d b1 删除分支时，需要做各种检查
+3.4.8、解决冲突
+当两个分支上对文件的修改可能会存在冲突，例如同时修改了同一个文件的同一行，这时就需要手动解决冲突，解决冲突步骤如下：
+处理文件中冲突的地方
+将解决完冲突的文件加入暂存区 (add)
+提交到仓库 (commit)
+冲突部分的内容处理如下所示：
+zhang@zhangmeng MINGW64 /c/czbk_advanced/git-test (master)
+$ git merge dev
+Auto - merging file01.txt
+CONFLICT (content): Merge conflict in file01.txt 提示 file01.txt 文件中有冲突
+Automatic merge failed; fix conflicts and then commit the result.
+zhang@zhangmeng MINGW64 /c/czbk_advanced/git-test (master|MERGING)
+$ cat file01.txt
+<<<<<<< HEAD
+count=1 ←— master 分支上修改的内容
+=======
+count=2 ←— dev 分支上修改的内容
+dev
+zhang@zhangmeng MINGW64 /c/czbk_advanced/git-test (master|MERGING)
+$ vi file01.txt
+zhang@zhangmeng MINGW64 /c/czbk_advanced/git-test (master|MERGING)
+$ cat file01.txt
+count=2 ←— 修改成我们希望合并后的样子
+zhang@zhangmeng MINGW64 /c/czbk_advanced/git-test (master|MERGING)
+$ git add . 添加到暂存区
+zhang@zhangmeng MINGW64 /c/czbk_advanced/git-test (master|MERGING)
+$ git commit
+[master 98eb214] Merge branch 'dev'

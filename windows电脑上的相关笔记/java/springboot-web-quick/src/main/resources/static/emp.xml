@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd">
+</beans>-->
+<emps>
+   <emp>
+       <name>金毛狮王</name>
+       <age>55</age>
+       <image>https://web-framework.oss-cn-hangzhou.aliyuncs.com/web/1.jpg</image>
+       <gender>1</gender>
+       <job>1</job>
+
+   </emp>
+
+    <emp>
+        <name>白眉鹰王</name>
+        <age>65</age>
+        <image>https://web-framework.oss-cn-hangzhou.aliyuncs.com/web/2.jpg</image>
+        <gender>1</gender>
+        <job>1</job>
+    </emp>
+    </emps>

@@ -1,0 +1,14 @@
+这些内容全部在我fork下来的仓库里面，而且代码什么的更加详细，如果想进一步了解的请移向那里
+
+
+哈哈哈哈哈哈哈哈哈哈
+
+
+
+
+
+
+
+https://java2ai.com/docs/frameworks/agent-framework/tutorials/agents
+
+看到了interceptors部分了，回来有空接着看，我现在想测试了

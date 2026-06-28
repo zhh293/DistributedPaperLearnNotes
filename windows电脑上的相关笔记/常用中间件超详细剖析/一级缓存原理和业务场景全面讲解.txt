@@ -1,0 +1,1427 @@
+2.1 一级缓存的起源：ORM 框架的痛点解决方案
+背景：在 ORM 框架 (如 Hibernate、MyBatis) 出现之前，开发者直接使用 JDBC 操作数据库。
+问题 1：同一个业务方法内，可能多次执行完全相同的 SQL 查询
+问题 2：每次查询都要建立数据库连接、发送 SQL、解析结果集
+问题 3：数据库连接是稀缺资源，高频查询会迅速耗尽连接池
+起源：Hibernate 在 2001 年首次引入了一级缓存 (Session 级缓存) 的概念，随后 MyBatis 等所有 ORM 框架都跟进了这一设计。
+2.2 一级缓存的本质
+一级缓存是 ORM 框架默认开启的、会话级别的本地内存缓存。
+存储位置：SqlSession (MyBatis) 或 Session (Hibernate) 对象内部
+生命周期：与 SqlSession 完全一致，会话关闭则缓存清空
+作用范围：仅在同一个 SqlSession 内有效，不同 SqlSession 之间缓存不共享
+2.3 MyBatis 一级缓存的工作原理
+MyBatis 的一级缓存实现在BaseExecutor类中，核心是一个HashMap：
+java
+运行
+// MyBatis 3.5.13源码
+public abstract class BaseExecutor implements Executor {
+  // 一级缓存：key是CacheKey，value是查询结果
+  protected PerpetualCache localCache;
+  
+  @Override
+  public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler) throws SQLException {
+    // 1. 生成缓存key
+    CacheKey key = createCacheKey(ms, parameter, rowBounds);
+    // 2. 先查一级缓存
+    List<E> list = (List<E>) localCache.getObject(key);
+    if (list != null) {
+      return list; // 缓存命中，直接返回
+    }
+    // 3. 缓存未命中，查询数据库
+    list = queryFromDatabase(ms, parameter, rowBounds, resultHandler, key);
+    // 4. 结果存入一级缓存
+    localCache.putObject(key, list);
+    return list;
+  }
+}
+缓存 Key 的组成：
+MappedStatement 的 id (全限定类名 + 方法名)
+SQL 语句
+参数值
+分页参数 (rowBounds)
+环境 id
+2.4 一级缓存的核心作用
+减少数据库访问次数：同一个会话内相同查询只执行一次 SQL
+提升响应速度：内存访问比数据库快 1000 倍以上
+减轻数据库压力：避免重复查询消耗数据库资源
+解决会话内数据一致性问题：同一个会话内的增删改会自动清空缓存
+2.5 一级缓存的局限性
+会话隔离：不同 SqlSession 之间缓存不共享，多实例环境下会出现脏数据
+更新即失效：同一个会话内执行任何增删改操作，都会清空整个一级缓存
+无法控制：默认强制开启，无法全局关闭 (只能局部关闭)
+内存泄漏风险：长会话会导致缓存数据越来越多，占用大量内存
+2.6 为什么一级缓存是默认开启的？
+这是一个非常经典的面试题，答案是：
+性能收益远大于风险：对于绝大多数单线程业务场景，一级缓存能带来巨大的性能提升
+符合 ORM 的设计理念：ORM 框架希望在同一个会话内，对同一个数据的多次查询返回相同的对象
+向后兼容：从框架诞生之初就存在，大量应用依赖这一特性
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+本地缓存技术的演进：从入门到企业级
+
+
+
+3.1 入门级：JDK 原生实现
+3.1.1 HashMap/ConcurrentHashMap
+最简单的本地缓存实现，直接使用 JDK 自带的 Map：
+java
+运行
+// 线程不安全，仅适用于单线程场景
+private static final Map<String, Object> cache = new HashMap<>();
+
+// 线程安全，适用于并发场景
+private static final Map<String, Object> cache = new ConcurrentHashMap<>();
+优点：
+零依赖，开箱即用
+性能极高，无额外开销
+缺点：
+没有过期策略，数据会一直存在
+没有淘汰算法，内存满了会 OOM
+没有统计功能，无法监控命中率
+没有自动加载机制
+适用场景：临时缓存、不变数据缓存、简单演示
+3.1.2 LinkedHashMap 实现 LRU 缓存
+利用LinkedHashMap的removeEldestEntry方法可以实现简单的 LRU (最近最少使用) 缓存：
+java
+运行
+public class LRUCache<K, V> extends LinkedHashMap<K, V> {
+  private final int maxSize;
+
+  public LRUCache(int maxSize) {
+    // accessOrder=true：按访问顺序排序
+    super(maxSize, 0.75f, true);
+    this.maxSize = maxSize;
+  }
+
+  @Override
+  protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+    // 当缓存大小超过maxSize时，删除最久未使用的元素
+    return size() > maxSize;
+  }
+}
+
+
+
+
+3.2 框架级：Guava Cache（经典实现）
+Guava Cache 是 Google 在 2010 年推出的本地缓存框架，解决了 JDK 原生缓存的所有问题。
+核心特性：
+支持基于时间的过期策略 (写入后过期、访问后过期)
+支持基于大小的淘汰策略 (LRU)
+支持自动加载数据 (CacheLoader)
+支持缓存统计 (命中率、加载时间等)
+支持移除监听器
+线程安全
+使用示例：
+java
+运行
+// 创建缓存
+LoadingCache<String, User> userCache = CacheBuilder.newBuilder()
+  .maximumSize(1000) // 最大容量
+  .expireAfterWrite(30, TimeUnit.MINUTES) // 写入后30分钟过期
+  .expireAfterAccess(10, TimeUnit.MINUTES) // 访问后10分钟过期
+  .recordStats() // 开启统计
+  .build(new CacheLoader<String, User>() {
+    @Override
+    public User load(String userId) throws Exception {
+      // 缓存未命中时，自动从数据库加载
+      return userMapper.selectById(userId);
+    }
+  });
+
+// 使用缓存
+User user = userCache.get("123");
+
+
+
+
+3.3 企业级：Caffeine（Java 本地缓存事实标准）
+Caffeine 是由 Ben Manes 在 2015 年推出的新一代本地缓存框架，现在已经完全取代了 Guava Cache，成为 Java 生态中本地缓存的事实标准。
+为什么 Caffeine 比 Guava Cache 好？
+核心原因是 Caffeine 使用了W-TinyLFU(Window Tiny Least Frequently Used) 淘汰算法，而 Guava Cache 使用的是 LRU 算法。
+LRU 算法的问题：
+只关注最近使用时间，不关注使用频率
+容易被 "缓存污染"：一次批量查询会把所有热点数据挤出缓存
+W-TinyLFU 算法的优势：
+结合了 LRU 和 LFU 的优点
+既关注最近使用时间，也关注使用频率
+对突发流量有很好的适应性
+命中率比 LRU 高 30%-50%
+Caffeine 的核心特性：
+性能是 Guava Cache 的 5-10 倍
+支持更灵活的过期策略
+支持异步加载
+支持基于权重的容量限制
+完美兼容 Guava Cache 的 API
+使用示例：
+java
+运行
+// 创建缓存
+LoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(Duration.ofMinutes(30))
+  .expireAfterAccess(Duration.ofMinutes(10))
+  .recordStats()
+  .build(userId -> userMapper.selectById(userId));
+
+// 使用缓存
+User user = userCache.get("123");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Caffine超详细全面的讲解一下
+
+
+Caffeine 源码级全解：从架构设计到核心实现（Java 本地缓存终极指南）
+源码版本：Caffeine 3.1.8（2026 年最新稳定版，Spring Boot 3.x 默认集成）前置知识：Java 并发编程、ConcurrentHashMap、LRU/LFU 算法基础学习目标：彻底理解 Caffeine 的高性能设计，能够阅读核心源码，解决生产环境问题
+
+
+
+
+
+
+
+一、Caffeine 整体架构与设计哲学
+1.1 为什么 Caffeine 是 "缓存之王"？
+Caffeine 由 Google 工程师 Ben Manes 于 2015 年创建，完全重写了 Guava Cache，解决了 Guava Cache 的所有性能问题：
+命中率提升 30%-50%：采用革命性的 W-TinyLFU 淘汰算法
+性能提升 5-10 倍：无锁读取 + 异步写入 + 事件驱动架构
+功能更丰富：支持异步加载、自动刷新、自定义过期等
+内存效率更高：优化的对象模型和数据结构
+官方性能对比（16 线程并发读写）：
+表格
+缓存框架	读吞吐量 (ops/ms)	写吞吐量 (ops/ms)	综合性能
+Caffeine	28,546	11,234	100%
+Guava Cache	896	113	3.5%
+ConcurrentHashMap	27,890	10,876	97%
+惊人的事实：Caffeine 的读写性能几乎与 ConcurrentHashMap 持平，同时提供了完整的缓存功能！
+1.2 核心架构图
+Caffeine 采用分层模块化设计，从下到上分为四层：
+plaintext
+┌─────────────────────────────────────────────────────────┐
+│                  API层（Cache/LoadingCache）             │
+├─────────────────────────────────────────────────────────┤
+│                  功能层（过期、加载、刷新、统计）         │
+├─────────────────────────────────────────────────────────┤
+│                  核心层（W-TinyLFU淘汰、并发控制）       │
+├─────────────────────────────────────────────────────────┤
+│                  存储层（ConcurrentHashMap + 队列）       │
+└─────────────────────────────────────────────────────────┘
+1.3 事件驱动的异步架构
+这是 Caffeine 与 Guava Cache 最本质的区别：
+Guava Cache：所有操作同步执行，读写时直接修改 LRU 链表，锁竞争严重
+Caffeine：读写操作立即返回，所有元数据更新（访问时间、频率、链表）异步提交到事件队列，由后台线程批量处理
+核心优势：
+读操作完全无锁，性能接近 ConcurrentHashMap
+写操作仅需极短时间的锁，锁粒度极细
+批量处理事件，减少系统调用和上下文切换
+
+
+
+
+
+
+
+
+
+二、核心数据结构源码解析
+2.1 Node 节点：缓存的基本单元
+所有缓存条目都封装在Node对象中，Caffeine 根据配置的功能动态生成不同的 Node 实现类（字节码生成技术，避免无用字段占用内存）：
+java
+运行
+// 简化版Node接口（caffeine-3.1.8）
+public interface Node<K, V> {
+  // 核心字段
+  K getKey();
+  V getValue();
+  void setValue(V value);
+  
+  // 访问时间（用于过期和LRU）
+  long getAccessTime();
+  void setAccessTime(long time);
+  boolean casAccessTime(long expect, long update);
+  
+  // 写入时间（用于写过期）
+  long getWriteTime();
+  void setWriteTime(long time);
+  
+  // 访问频率（用于TinyLFU）
+  int getFrequency();
+  void incrementFrequency();
+  
+  // LRU链表指针
+  Node<K, V> getPreviousInAccessOrder();
+  void setPreviousInAccessOrder(Node<K, V> prev);
+  Node<K, V> getNextInAccessOrder();
+  void setNextInAccessOrder(Node<K, V> next);
+  
+  // 写顺序链表指针
+  Node<K, V> getPreviousInWriteOrder();
+  void setPreviousInWriteOrder(Node<K, V> prev);
+  Node<K, V> getNextInWriteOrder();
+  void setNextInWriteOrder(Node<K, V> next);
+}
+内存优化技巧：
+所有字段都是volatile，保证多线程可见性
+使用cas操作更新元数据，避免锁
+动态生成 Node 实现类，只包含配置所需的字段
+例如：如果没有配置写过期，就不会有writeTime字段
+2.2 数据存储：ConcurrentHashMap
+Caffeine 直接使用 JDK 的ConcurrentHashMap作为核心存储结构：
+java
+运行
+// BoundedLocalCache.java（核心实现类）
+public class BoundedLocalCache<K, V> extends LocalCache<K, V> {
+  // 核心存储：键 -> Node节点
+  final ConcurrentHashMap<Object, Node<K, V>> data;
+  
+  // 构造函数
+  BoundedLocalCache(Caffeine<K, V> builder, @Nullable CacheLoader<? super K, V> loader, boolean async) {
+    super(builder, loader, async);
+    // 初始化ConcurrentHashMap
+    this.data = new ConcurrentHashMap<>(builder.getInitialCapacity());
+    // ... 其他初始化
+  }
+}
+为什么不自己实现哈希表？
+JDK 的 ConcurrentHashMap 经过了极致优化，性能和稳定性都非常好
+Caffeine 专注于缓存功能，不重复造轮子
+可以直接受益于 JDK 的升级和优化
+2.3 事件队列：RingBuffer
+Caffeine 使用环形缓冲区 (RingBuffer) 记录所有访问事件，实现异步处理：
+java
+运行
+// BoundedLocalCache.java
+final RingBuffer<ReadEvent<K, V>> readBuffer;
+final RingBuffer<WriteEvent<K, V>> writeBuffer;
+
+// 读操作提交事件
+public V getIfPresent(Object key) {
+  Node<K, V> node = data.get(key);
+  if (node == null) {
+    return null;
+  }
+  
+  // 提交读事件到环形缓冲区
+  readBuffer.submit(new ReadEvent<>(node));
+  
+  return node.getValue();
+}
+
+// 后台线程批量处理事件
+void drainBuffers() {
+  // 处理所有读事件
+  readBuffer.drainTo(event -> {
+    Node<K, V> node = event.node;
+    // 更新访问时间
+    node.setAccessTime(System.nanoTime());
+    // 增加访问频率
+    node.incrementFrequency();
+    // 更新LRU链表
+    accessOrderDeque.moveToBack(node);
+  });
+  
+  // 处理所有写事件
+  writeBuffer.drainTo(event -> {
+    // ... 处理写事件
+  });
+}
+环形缓冲区的优势：
+无锁写入，性能极高
+批量处理事件，减少系统开销
+可以控制事件处理的频率，避免后台线程占用过多 CPU
+
+
+
+
+
+
+三、W-TinyLFU 淘汰算法源码深度解析（核心中的核心）
+W-TinyLFU 是 Caffeine 最核心的创新，也是它命中率远超其他缓存的根本原因。它完美结合了 LRU 和 LFU 的优点，同时解决了它们的缺点。
+3.1 传统算法的痛点
+表格
+算法	优点	缺点
+LRU	实现简单，对突发流量友好	容易被缓存污染，冷数据会顶掉热数据
+LFU	优先保留高频数据	新数据冷启动差，历史高频数据难淘汰，内存开销大
+3.2 W-TinyLFU 整体设计
+W-TinyLFU 采用三层缓存分区 + 频率统计 + 动态调整的架构：
+plaintext
+┌─────────────────────────────────────────────────────────┐
+│                    Window Cache (1%)                    │
+│                  新数据入口，LRU淘汰                     │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────┐
+│                    TinyLFU 过滤器                       │
+│              Count-Min Sketch 统计访问频率              │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────┐
+│                    Main Cache (99%)                     │
+│  ┌─────────────────┐  ┌─────────────────────────────┐  │
+│  │ Probation (20%) │  │        Protected (80%)      │  │
+│  │   冷数据区      │  │          热数据区           │  │
+│  │   LRU淘汰       │  │          LRU淘汰            │  │
+│  └─────────────────┘  └─────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+3.3 Count-Min Sketch：高效频率统计
+传统 LFU 需要为每个条目维护一个 32 位计数器，内存开销巨大。Caffeine 使用Count-Min Sketch算法，以极低的内存开销近似统计访问频率。
+原理：
+使用 4 个哈希函数和 4 个计数器数组
+每个 key 通过 4 个哈希函数映射到 4 个不同的计数器
+访问时，4 个计数器都加 1
+频率估计值取 4 个计数器中的最小值（避免哈希冲突导致的高估）
+源码实现：
+java
+运行
+// FrequencySketch.java
+public final class FrequencySketch<E> {
+  // 4个计数器数组，每个元素是4位（最大值15）
+  private final long[] table;
+  // 计数器数组长度（2的幂）
+  private final int length;
+  // 重置阈值，当总访问次数达到此值时，所有计数器减半
+  private int resetThreshold;
+  // 总访问次数
+  private int size;
+
+  // 增加key的访问频率
+  public void increment(E e) {
+    if (e == null) {
+      return;
+    }
+    
+    int hash = spread(e.hashCode());
+    int start = (hash & 3) << 2; // 0, 4, 8, 12
+    
+    // 4个哈希函数，对应4个计数器数组
+    for (int i = 0; i < 4; i++) {
+      int index = indexOf(hash, i);
+      int offset = start + i;
+      
+      // 计数器是4位，所以需要计算在long中的位置
+      int shift = (index & 15) << 2;
+      int mask = 0xF << shift;
+      int count = (int) ((table[index >>> 4] >>> shift) & 0xF);
+      
+      // 如果计数器没有达到最大值15，就加1
+      if (count < 15) {
+        table[index >>> 4] += 1L << shift;
+      }
+    }
+    
+    size++;
+    
+    // 当总访问次数达到阈值时，所有计数器减半（衰减）
+    if (size == resetThreshold) {
+      reset();
+    }
+  }
+
+  // 获取key的访问频率
+  public int frequency(E e) {
+    if (e == null) {
+      return 0;
+    }
+    
+    int hash = spread(e.hashCode());
+    int start = (hash & 3) << 2;
+    int frequency = Integer.MAX_VALUE;
+    
+    // 取4个计数器中的最小值
+    for (int i = 0; i < 4; i++) {
+      int index = indexOf(hash, i);
+      int offset = start + i;
+      int shift = (index & 15) << 2;
+      int count = (int) ((table[index >>> 4] >>> shift) & 0xF);
+      frequency = Math.min(frequency, count);
+    }
+    
+    return frequency;
+  }
+
+  // 衰减：所有计数器减半，避免历史数据影响
+  private void reset() {
+    int count = 0;
+    for (int i = 0; i < table.length; i++) {
+      count += Long.bitCount(table[i] & 0x1111111111111111L);
+      table[i] = (table[i] >>> 1) & 0x7777777777777777L;
+    }
+    size = (size >>> 1) - (count >>> 2);
+  }
+}
+关键设计细节：
+每个计数器只有4 位，最大值 15，内存开销极低
+总访问次数达到阈值时，所有计数器减半，实现频率衰减
+取最小值作为频率估计，有效避免哈希冲突导致的高估
+对于 100 万条数据，仅需512KB内存，比传统 LFU 节省 98% 的内存
+3.4 三层缓存分区源码实现
+Caffeine 将缓存分为三个区域：Window、Probation、Protected，每个区域都是一个 LRU 双端队列。
+源码实现：
+java
+运行
+// BoundedLocalCache.java
+// Window区域：新数据入口，默认占总容量的1%
+final NodeDeque<K, V> accessOrderEdenDeque;
+// Main区域：Probation（20%）和Protected（80%）
+final NodeDeque<K, V> accessOrderProbationDeque;
+final NodeDeque<K, V> accessOrderProtectedDeque;
+
+// 容量配置
+long maximum; // 总容量
+long edenMaximum; // Window区域最大容量
+long protectedMaximum; // Protected区域最大容量
+long edenSize; // Window区域当前大小
+long probationSize; // Probation区域当前大小
+long protectedSize; // Protected区域当前大小
+数据流转过程：
+新数据首先进入Window 区域
+当 Window 区域满了，淘汰最久未使用的条目，进入TinyLFU 过滤器
+如果该条目的频率高于 Probation 区域中最久未使用条目的频率，则进入Probation 区域
+Probation 区域的条目被再次访问时，晋升到Protected 区域
+当 Protected 区域满了，最久未使用的条目降级到Probation 区域
+当需要淘汰数据时，从 Probation 区域淘汰最久未使用的条目
+3.5 淘汰决策过程源码解析
+当缓存容量达到最大值时，Caffeine 会执行淘汰逻辑：
+java
+运行
+// BoundedLocalCache.java
+void evictEntries() {
+  // 计算需要淘汰的数量
+  long excess = weightedSize() - maximum;
+  if (excess <= 0) {
+    return;
+  }
+  
+  // 先淘汰Window区域
+  while (excess > 0 && edenSize > 0) {
+    Node<K, V> candidate = accessOrderEdenDeque.pollFirst();
+    edenSize--;
+    excess--;
+    
+    // 尝试将候选条目放入Main区域
+    if (admit(candidate)) {
+      addToProbation(candidate);
+    } else {
+      // 淘汰该条目
+      evictEntry(candidate, RemovalCause.SIZE);
+    }
+  }
+  
+  // 再淘汰Main区域
+  while (excess > 0 && (probationSize > 0 || protectedSize > 0)) {
+    // 从Probation区域淘汰最久未使用的条目
+    Node<K, V> victim = accessOrderProbationDeque.pollFirst();
+    probationSize--;
+    excess--;
+    
+    evictEntry(victim, RemovalCause.SIZE);
+  }
+}
+
+// TinyLFU准入决策：是否允许候选条目进入Main区域
+boolean admit(Node<K, V> candidate) {
+  // 如果Main区域为空，直接准入
+  if (probationSize == 0 && protectedSize == 0) {
+    return true;
+  }
+  
+  // 获取Probation区域最久未使用的条目作为受害者
+  Node<K, V> victim = accessOrderProbationDeque.peekFirst();
+  if (victim == null) {
+    return true;
+  }
+  
+  // 比较候选条目和受害者的频率
+  int candidateFrequency = frequencySketch.frequency(candidate.getKey());
+  int victimFrequency = frequencySketch.frequency(victim.getKey());
+  
+  // 如果候选条目的频率更高，准入，否则淘汰
+  return candidateFrequency > victimFrequency;
+}
+3.6 动态窗口调整
+Caffeine 会根据工作负载自动调整 Window 区域的大小，以适应不同的访问模式：
+如果是扫描密集型场景（大量一次性访问），扩大 Window 区域
+如果是热点密集型场景（少量高频访问），缩小 Window 区域
+源码实现：
+java
+运行
+// BoundedLocalCache.java
+// 窗口调整器
+final HillClimbingWindowAdjuster windowAdjuster;
+
+// 每次淘汰后，调整窗口大小
+void adjustWindowSize() {
+  windowAdjuster.adjust();
+}
+
+// HillClimbingWindowAdjuster.java
+void adjust() {
+  // 计算命中率变化
+  double hitRate = stats.hitRate();
+  double previousHitRate = previousHitRate.get();
+  
+  // 如果命中率提升，继续调整方向；否则反转方向
+  if (hitRate > previousHitRate) {
+    step = Math.min(step * 1.1, MAX_STEP);
+  } else if (hitRate < previousHitRate) {
+    step = -step * 0.9;
+  }
+  
+  // 调整窗口大小
+  long newEdenMaximum = Math.max(1, Math.min(maximum - 1, edenMaximum + (long) step));
+  
+  // 更新窗口大小
+  if (newEdenMaximum != edenMaximum) {
+    setEdenMaximum(newEdenMaximum);
+  }
+  
+  previousHitRate.set(hitRate);
+}
+
+
+
+
+
+四、过期策略源码解析
+Caffeine 提供了三种核心过期策略，以及一种自定义过期策略，所有过期策略都采用惰性清理 + 后台清理的混合机制。
+4.1 过期清理机制
+清理时机：
+惰性清理：访问（get/put）时检查当前条目是否过期
+后台清理：默认每 1 秒执行一次，批量扫描并删除过期条目
+容量淘汰：缓存满时，优先淘汰过期条目
+为什么不实时清理？
+实时清理需要额外的线程和定时器，性能开销大
+惰性清理 + 后台清理的组合已经足够满足绝大多数场景
+过期数据不会影响缓存的正确性，只是暂时占用一点内存
+4.2 expireAfterWrite：写后过期
+原理：从条目创建或最后一次更新时间开始计时，经过指定时间后过期。
+源码实现：
+java
+运行
+// FixedExpiration.java
+public class FixedExpiration<K, V> implements Expiration<K, V> {
+  private final Duration duration;
+  
+  @Override
+  public long expireAfterCreate(K key, V value, long currentTime) {
+    return currentTime + duration.toNanos();
+  }
+  
+  @Override
+  public long expireAfterUpdate(K key, V value, long currentTime, long currentDuration) {
+    return currentTime + duration.toNanos();
+  }
+  
+  @Override
+  public long expireAfterRead(K key, V value, long currentTime, long currentDuration) {
+    return currentDuration; // 读操作不重置过期时间
+  }
+}
+
+// BoundedLocalCache.java
+// 写操作时设置过期时间
+public V put(K key, V value) {
+  long now = System.nanoTime();
+  Node<K, V> node = data.get(key);
+  
+  if (node == null) {
+    node = nodeFactory.newNode(key, value, now);
+    // 设置过期时间
+    node.setVariableTime(expiration.expireAfterCreate(key, value, now));
+    data.put(key, node);
+  } else {
+    V oldValue = node.getValue();
+    node.setValue(value);
+    // 更新过期时间
+    node.setVariableTime(expiration.expireAfterUpdate(key, value, now, node.getVariableTime()));
+  }
+  
+  return oldValue;
+}
+
+// 读操作时检查是否过期
+public V getIfPresent(Object key) {
+  Node<K, V> node = data.get(key);
+  if (node == null) {
+    return null;
+  }
+  
+  long now = System.nanoTime();
+  // 检查是否过期
+  if (node.getVariableTime() <= now) {
+    // 惰性删除
+    data.remove(key);
+    evictEntry(node, RemovalCause.EXPIRED);
+    return null;
+  }
+  
+  // 提交读事件
+  readBuffer.submit(new ReadEvent<>(node));
+  
+  return node.getValue();
+}
+4.3 expireAfterAccess：访问后过期
+原理：每次读取或写入都会重置过期时间，适合缓存热点数据。
+源码实现：
+java
+运行
+// FixedExpiration.java
+@Override
+public long expireAfterRead(K key, V value, long currentTime, long currentDuration) {
+  return currentTime + duration.toNanos(); // 读操作重置过期时间
+}
+
+// BoundedLocalCache.java
+// 读操作时更新过期时间
+public V getIfPresent(Object key) {
+  Node<K, V> node = data.get(key);
+  if (node == null) {
+    return null;
+  }
+  
+  long now = System.nanoTime();
+  if (node.getVariableTime() <= now) {
+    data.remove(key);
+    evictEntry(node, RemovalCause.EXPIRED);
+    return null;
+  }
+  
+  // 更新过期时间
+  node.setVariableTime(expiration.expireAfterRead(key, node.getValue(), now, node.getVariableTime()));
+  
+  readBuffer.submit(new ReadEvent<>(node));
+  
+  return node.getValue();
+}
+4.4 expireAfter：自定义过期策略
+原理：允许为每个条目设置不同的过期时间，非常灵活。
+使用示例：
+java
+运行
+LoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfter(new Expiry<String, User>() {
+    @Override
+    public long expireAfterCreate(String key, User user, long currentTime) {
+      // VIP用户过期时间长，普通用户过期时间短
+      if (user.isVip()) {
+        return TimeUnit.HOURS.toNanos(24);
+      } else {
+        return TimeUnit.MINUTES.toNanos(30);
+      }
+    }
+    
+    @Override
+    public long expireAfterUpdate(String key, User user, long currentTime, long currentDuration) {
+      return expireAfterCreate(key, user, currentTime);
+    }
+    
+    @Override
+    public long expireAfterRead(String key, User user, long currentTime, long currentDuration) {
+      return currentDuration;
+    }
+  })
+  .build(userId -> userMapper.selectById(userId));
+4.5 refreshAfterWrite：自动刷新
+原理：写入后经过指定时间，下次访问时会异步刷新缓存，刷新期间返回旧值。这是 Caffeine 最实用的特性之一，完美解决了缓存击穿问题。
+源码实现：
+java
+运行
+// BoundedLocalCache.java
+public V get(K key) throws ExecutionException {
+  Node<K, V> node = data.get(key);
+  if (node == null) {
+    return load(key); // 缓存未命中，同步加载
+  }
+  
+  long now = System.nanoTime();
+  // 检查是否需要刷新
+  if (needsRefresh(node, now)) {
+    // 异步刷新，不阻塞当前线程
+    refresh(key, node);
+  }
+  
+  // 返回旧值
+  return node.getValue();
+}
+
+// 检查是否需要刷新
+boolean needsRefresh(Node<K, V> node, long now) {
+  return (now - node.getWriteTime()) > refreshNanos;
+}
+
+// 异步刷新缓存
+void refresh(K key, Node<K, V> node) {
+  // 只有一个线程会执行刷新操作
+  if (node.casRefreshState(NOT_REFRESHING, REFRESHING)) {
+    executor.execute(() -> {
+      try {
+        // 调用CacheLoader.reload方法
+        V newValue = cacheLoader.reload(key, node.getValue()).get();
+        // 更新缓存
+        node.setValue(newValue);
+        node.setWriteTime(System.nanoTime());
+      } catch (Exception e) {
+        // 刷新失败，记录日志，不影响旧值
+        logger.warn("Failed to refresh key: " + key, e);
+      } finally {
+        node.setRefreshState(NOT_REFRESHING);
+      }
+    });
+  }
+}
+关键特性：
+刷新是异步的，不会阻塞读线程
+刷新期间返回旧值，用户无感知
+只有一个线程会执行刷新操作，避免重复刷新
+刷新失败不会影响缓存的可用性
+
+
+
+
+
+五、加载机制源码解析
+Caffeine 提供了三种加载方式：手动加载、同步自动加载、异步自动加载。
+5.1 手动加载：Cache
+最简单的加载方式，需要用户手动处理缓存未命中的情况：
+java
+运行
+Cache<String, User> cache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(30, TimeUnit.MINUTES)
+  .build();
+
+// 使用缓存
+User user = cache.getIfPresent("123");
+if (user == null) {
+  user = userMapper.selectById("123");
+  cache.put("123", user);
+}
+
+// 或者使用get方法，传入加载函数
+User user = cache.get("123", key -> userMapper.selectById(key));
+5.2 同步自动加载：LoadingCache
+在创建缓存时指定CacheLoader，缓存未命中时会自动调用load方法加载数据：
+java
+运行
+LoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(30, TimeUnit.MINUTES)
+  .build(new CacheLoader<String, User>() {
+    @Override
+    public User load(String key) throws Exception {
+      return userMapper.selectById(key);
+    }
+  });
+
+// 自动加载
+User user = userCache.get("123");
+互斥锁机制：当多个线程同时请求同一个不存在的 key 时，只有一个线程会执行load方法，其他线程等待，避免重复加载：
+java
+运行
+// BoundedLocalCache.java
+public V get(K key) throws ExecutionException {
+  Node<K, V> node = data.get(key);
+  if (node == null) {
+    // 尝试获取锁
+    CompletableFuture<V> future = loadingCache.get(key);
+    if (future == null) {
+      // 没有其他线程在加载，当前线程执行加载
+      future = CompletableFuture.supplyAsync(() -> {
+        try {
+          return cacheLoader.load(key);
+        } catch (Exception e) {
+          throw new CompletionException(e);
+        }
+      }, executor);
+      
+      loadingCache.put(key, future);
+      
+      try {
+        V value = future.get();
+        // 加载成功，放入缓存
+        put(key, value);
+        return value;
+      } finally {
+        loadingCache.remove(key);
+      }
+    } else {
+      // 其他线程正在加载，等待结果
+      return future.get();
+    }
+  }
+  
+  return node.getValue();
+}
+5.3 异步自动加载：AsyncLoadingCache
+异步加载数据，返回CompletableFuture，适合 IO 密集型场景：
+java
+运行
+AsyncLoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(30, TimeUnit.MINUTES)
+  .buildAsync(new CacheLoader<String, User>() {
+    @Override
+    public User load(String key) throws Exception {
+      return userMapper.selectById(key);
+    }
+  });
+
+// 异步加载
+CompletableFuture<User> future = userCache.get("123");
+future.thenAccept(user -> {
+  // 处理结果
+});
+
+
+
+
+六、并发模型源码解析
+Caffeine 的高性能很大程度上得益于其优秀的并发模型：无锁读取 + 异步写入 + 分段锁。
+6.1 无锁读取
+Caffeine 的读操作完全无锁，仅使用volatile和cas操作保证线程安全：
+java
+运行
+public V getIfPresent(Object key) {
+  // ConcurrentHashMap的get操作是无锁的
+  Node<K, V> node = data.get(key);
+  if (node == null) {
+    return null;
+  }
+  
+  long now = System.nanoTime();
+  // 检查是否过期
+  if (node.getVariableTime() <= now) {
+    // 惰性删除，使用ConcurrentHashMap的remove方法
+    data.remove(key);
+    evictEntry(node, RemovalCause.EXPIRED);
+    return null;
+  }
+  
+  // 提交读事件到环形缓冲区，无锁
+  readBuffer.submit(new ReadEvent<>(node));
+  
+  return node.getValue();
+}
+6.2 异步写入
+写操作仅需极短时间的锁，所有元数据更新异步处理：
+java
+运行
+public V put(K key, V value) {
+  long now = System.nanoTime();
+  // ConcurrentHashMap的put操作是分段锁的
+  Node<K, V> node = data.put(key, nodeFactory.newNode(key, value, now));
+  
+  // 提交写事件到环形缓冲区，无锁
+  writeBuffer.submit(new WriteEvent<>(key, value, now));
+  
+  return node == null ? null : node.getValue();
+}
+6.3 后台线程
+Caffeine 使用一个单线程池处理所有后台任务：
+java
+运行
+// Caffeine.java
+private static final ExecutorService DEFAULT_EXECUTOR = 
+  Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
+    .setNameFormat("caffeine-%d")
+    .setDaemon(true)
+    .build());
+
+// BoundedLocalCache.java
+// 后台任务调度器
+final ScheduledExecutorService scheduler = 
+  Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder()
+    .setNameFormat("caffeine-scheduler-%d")
+    .setDaemon(true)
+    .build());
+
+// 初始化时启动后台清理任务
+void scheduleCleanUp() {
+  scheduler.scheduleAtFixedRate(
+    this::cleanUp, // 清理任务
+    1, // 初始延迟1秒
+    1, // 每隔1秒执行一次
+    TimeUnit.SECONDS
+  );
+}
+
+// 清理任务
+void cleanUp() {
+  drainBuffers(); // 处理事件队列
+  expireEntries(); // 清理过期条目
+  evictEntries(); // 淘汰超出容量的条目
+}
+为什么使用单线程？
+单线程避免了线程竞争和上下文切换
+后台任务都是 CPU 密集型的，单线程已经足够
+可以保证任务的顺序执行，避免并发问题
+
+
+
+七、高级特性源码解析
+7.1 基于权重的容量限制
+除了基于条目数的容量限制，Caffeine 还支持基于权重的容量限制，适合缓存大小不一的对象：
+java
+运行
+LoadingCache<String, byte[]> cache = Caffeine.newBuilder()
+  .maximumWeight(100 * 1024 * 1024) // 最大100MB
+  .weigher((String key, byte[] value) -> value.length) // 权重是字节数组的长度
+  .build(key -> loadData(key));
+源码实现：
+java
+运行
+// BoundedLocalCache.java
+long weightedSize() {
+  return edenSize + probationSize + protectedSize;
+}
+
+// 添加条目时增加权重
+void addToEden(Node<K, V> node) {
+  accessOrderEdenDeque.addLast(node);
+  edenSize += node.getWeight();
+}
+
+// 淘汰条目时减少权重
+void evictEntry(Node<K, V> node, RemovalCause cause) {
+  // ... 其他清理
+  edenSize -= node.getWeight();
+  // ... 通知移除监听器
+}
+7.2 移除监听器
+当缓存条目被移除时，可以收到通知：
+java
+运行
+LoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(30, TimeUnit.MINUTES)
+  .removalListener((String key, User user, RemovalCause cause) -> {
+    System.out.println("Key " + key + " was removed because " + cause);
+  })
+  .build(userId -> userMapper.selectById(userId));
+移除原因：
+RemovalCause.EXPLICIT：手动删除
+RemovalCause.REPLACED：被新值替换
+RemovalCause.EXPIRED：过期
+RemovalCause.SIZE：容量不足被淘汰
+RemovalCause.COLLECTED：被垃圾回收器回收
+7.3 缓存统计
+Caffeine 提供了详细的缓存统计信息，用于监控和调优：
+java
+运行
+LoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(30, TimeUnit.MINUTES)
+  .recordStats() // 开启统计
+  .build(userId -> userMapper.selectById(userId));
+
+// 获取统计信息
+CacheStats stats = userCache.stats();
+System.out.println("Hit rate: " + stats.hitRate());
+System.out.println("Miss rate: " + stats.missRate());
+System.out.println("Average load time: " + stats.averageLoadPenalty() + "ns");
+System.out.println("Eviction count: " + stats.evictionCount());
+
+
+
+八、企业级最佳实践与常见坑点
+8.1 最佳实践
+优先使用 Caffeine：不要自己实现缓存，也不要使用 Guava Cache
+使用 Spring Cache 抽象：统一编程模型，方便切换缓存实现
+合理设置容量：根据 JVM 内存大小设置，一般不超过堆内存的 20%
+合理设置过期时间：根据数据更新频率设置，避免数据长期驻留内存
+使用 refreshAfterWrite：解决缓存击穿问题，提升系统稳定性
+开启缓存统计：监控命中率、加载时间等关键指标
+使用异步加载：对于 IO 密集型场景，使用 AsyncLoadingCache
+合理设置线程池：对于异步加载和刷新，配置合适的线程池
+
+
+
+8.2 常见坑点
+缓存容量设置过大：导致 JVM 内存不足，频繁 GC 甚至 OOM
+过期时间设置过长：导致脏数据问题
+缓存穿透：没有处理不存在的 key，导致数据库被攻击
+缓存击穿：热点 key 过期导致数据库压力骤增
+缓存雪崩：大量 key 同时过期导致数据库宕机
+缓存一致性问题：更新数据库后没有及时删除缓存
+内存泄漏：缓存了大对象或大量对象，没有及时清理
+线程池配置不当：异步加载和刷新的线程池过小，导致任务堆积
+8.3 生产环境配置示例
+java
+运行
+@Configuration
+@EnableCaching
+public class CacheConfig {
+  @Bean
+  public CacheManager cacheManager() {
+    CaffeineCacheManager cacheManager = new CaffeineCacheManager();
+    
+    // 全局配置
+    cacheManager.setCaffeine(Caffeine.newBuilder()
+      .maximumSize(10000)
+      .expireAfterWrite(30, TimeUnit.MINUTES)
+      .refreshAfterWrite(10, TimeUnit.MINUTES)
+      .recordStats()
+      .removalListener((key, value, cause) -> {
+        if (cause == RemovalCause.SIZE) {
+          log.warn("Cache evicted due to size limit: {}", key);
+        }
+      }));
+    
+    // 自定义缓存配置
+    Map<String, Caffeine<Object, Object>> cacheConfigs = new HashMap<>();
+    cacheConfigs.put("user", Caffeine.newBuilder()
+      .maximumSize(50000)
+      .expireAfterWrite(1, TimeUnit.HOURS)
+      .refreshAfterWrite(30, TimeUnit.MINUTES)
+      .recordStats());
+    
+    cacheConfigs.put("product", Caffeine.newBuilder()
+      .maximumSize(100000)
+      .expireAfterWrite(6, TimeUnit.HOURS)
+      .refreshAfterWrite(1, TimeUnit.HOURS)
+      .recordStats());
+    
+    cacheManager.setCacheConfigurations(cacheConfigs);
+    
+    return cacheManager;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Caffeine 多机数据一致性企业级全方案：原理、优缺点与主流选型
+核心前提：Caffeine 是进程内本地缓存，天然不支持分布式共享。所有方案都是最终一致性，不存在完美的强一致性方案。我们只能在一致性、性能、复杂度三者之间做权衡。
+一、问题根源：为什么本地缓存会有一致性问题？
+在微服务多实例部署下，每个服务实例都有自己独立的 Caffeine 缓存副本：
+实例 A 更新了数据库并删除了自己的本地缓存
+实例 B 的本地缓存中仍然保留着旧数据
+后续请求落到实例 B 上，就会返回脏数据
+不一致的时间窗口：从数据更新到所有实例的本地缓存都被清除的这段时间。
+二、7 种企业级一致性方案全解析
+方案 1：短过期时间兜底方案（所有方案的基础）
+核心原理：不给本地缓存设置过长的过期时间，让数据不一致的时间窗口尽可能短。即使其他同步机制失效，最多也只会在 TTL 时间内返回脏数据。
+实现步骤：
+java
+运行
+// 本地缓存配置，所有数据最多缓存5分钟
+Caffeine.newBuilder()
+  .maximumSize(10000)
+  .expireAfterWrite(5, TimeUnit.MINUTES) // 短TTL兜底
+  .build();
+优点：
+实现最简单，零额外开发
+零额外依赖，不增加系统复杂度
+绝对可靠，不会出现永久不一致
+缺点：
+一致性最差，不一致时间窗口等于 TTL
+缓存命中率降低，增加 Redis 和数据库压力
+适用场景：
+非核心数据，对一致性要求不高
+所有其他方案的必须兜底策略
+快速上线的 MVP 项目
+
+
+
+
+
+方案 2：Redis Pub/Sub 主动失效方案（当前最主流）
+核心原理：当数据更新时，通过 Redis 的发布订阅功能，向所有服务实例广播 "缓存失效" 消息。所有实例收到消息后，删除自己本地对应的缓存条目。
+完整流程：
+实例 A 更新数据库
+实例 A 删除 Redis 中的分布式缓存
+实例 A 向 Redis 频道cache:invalidate发布消息：{cacheName: "user", key: "123"}
+所有服务实例（包括 A 自己）订阅该频道
+收到消息后，调用caffeineCache.invalidate(key)删除本地缓存
+后续请求查询时，缓存未命中，从 Redis 或数据库加载最新数据
+实现代码：
+java
+运行
+// 1. 发布消息（数据更新时）
+@Transactional
+public void updateUser(User user) {
+  userMapper.updateById(user); // 更新数据库
+  redisTemplate.delete("user:" + user.getId()); // 删除Redis缓存
+  
+  // 发布缓存失效消息
+  CacheInvalidateMessage message = new CacheInvalidateMessage("user", user.getId().toString());
+  redisTemplate.convertAndSend("cache:invalidate", message);
+}
+
+// 2. 订阅消息（所有实例）
+@Configuration
+public class RedisCacheConfig {
+  @Bean
+  public RedisMessageListenerContainer container(RedisConnectionFactory factory) {
+    RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+    container.setConnectionFactory(factory);
+    
+    // 订阅缓存失效频道
+    container.addMessageListener((message, pattern) -> {
+      CacheInvalidateMessage msg = JSON.parseObject(message.getBody(), CacheInvalidateMessage.class);
+      Cache cache = cacheManager.getCache(msg.getCacheName());
+      if (cache != null) {
+        cache.evict(msg.getKey()); // 删除本地缓存
+        log.info("本地缓存失效: cacheName={}, key={}", msg.getCacheName(), msg.getKey());
+      }
+    }, new ChannelTopic("cache:invalidate"));
+    
+    return container;
+  }
+}
+优点：
+实时性好，不一致时间窗口 < 10ms
+实现简单，Redis 是大多数系统的标配
+轻量级，不需要独立部署消息队列
+性能好，Redis Pub/Sub 的吞吐量很高
+缺点：
+消息不持久化，Redis 宕机或网络分区会导致消息丢失
+没有消息确认机制，无法保证消息一定被消费
+不支持消息重试，消费失败就会永久不一致
+广播风暴：大量更新会导致所有实例同时失效缓存
+适用场景：
+中小型企业，集群规模 < 100 个实例
+对一致性要求中等的业务场景
+已经使用 Redis 作为分布式缓存的系统
+
+
+
+方案 3：MQ 消息广播失效方案（大型企业首选）
+核心原理：与 Redis Pub/Sub 类似，但使用专业的消息队列（Kafka/RabbitMQ/RocketMQ）代替 Redis Pub/Sub，解决消息丢失和可靠性问题。
+完整流程：
+实例 A 更新数据库
+实例 A 删除 Redis 缓存
+实例 A 向 MQ 主题cache-invalidate-topic发送消息
+所有服务实例作为消费者，订阅该主题
+收到消息后删除本地缓存
+消费失败时，MQ 会自动重试
+优点：
+消息持久化，不会丢失
+支持消息确认和重试机制，可靠性高
+支持消息堆积，应对突发流量
+可以监控消息的生产和消费情况
+支持分区，避免广播风暴
+缺点：
+引入了额外的消息队列系统，增加复杂度
+延迟比 Redis Pub/Sub 略高（毫秒级）
+需要处理消息重复消费的问题
+适用场景：
+大型企业，集群规模 > 100 个实例
+对一致性和可靠性要求较高的业务
+已经有 MQ 基础设施的系统
+
+
+
+
+方案 4：版本号校验方案（一致性更强）
+核心原理：每个缓存条目除了存储数据本身，还存储一个版本号。每次读取本地缓存时，先与 Redis 中的最新版本号进行对比，如果不一致则重新加载数据。
+实现步骤：
+java
+运行
+// 缓存数据结构
+@Data
+public class CacheValue<T> {
+  private T data;
+  private long version; // 版本号
+}
+
+// 读取缓存
+public User getUserById(Long userId) {
+  // 1. 先查本地缓存
+  CacheValue<User> localValue = localCache.getIfPresent(userId);
+  
+  // 2. 查Redis中的最新版本号
+  Long latestVersion = redisTemplate.opsForValue().get("user:version:" + userId);
+  
+  // 3. 如果本地缓存存在且版本号一致，直接返回
+  if (localValue != null && latestVersion != null && localValue.getVersion() == latestVersion) {
+    return localValue.getData();
+  }
+  
+  // 4. 版本不一致，从数据库加载最新数据
+  User user = userMapper.selectById(userId);
+  
+  // 5. 更新本地缓存和Redis版本号
+  if (user != null) {
+    long newVersion = System.currentTimeMillis();
+    localCache.put(userId, new CacheValue<>(user, newVersion));
+    redisTemplate.opsForValue().set("user:version:" + userId, newVersion);
+  }
+  
+  return user;
+}
+
+// 更新数据
+@Transactional
+public void updateUser(User user) {
+  userMapper.updateById(user);
+  // 更新版本号
+  redisTemplate.opsForValue().set("user:version:" + user.getId(), System.currentTimeMillis());
+}
+优点：
+一致性比前两种方案更强
+不依赖消息中间件，可靠性高
+不会出现永久不一致
+缺点：
+每次读取都要访问 Redis，本地缓存的性能优势被削弱
+Redis 压力增大
+实现复杂度较高
+适用场景：
+对一致性要求较高，但又不想放弃本地缓存性能的场景
+读多写少的业务
+
+
+方案 5：CDC 变更数据捕获方案（最可靠）
+核心原理：通过 CDC 工具（Debezium/Flink CDC）直接监听数据库的 binlog 变更，当数据库数据发生变化时，自动发送缓存失效消息。
+完整流程：
+用户更新数据库，产生 binlog
+Debezium 捕获 binlog 变更事件
+Debezium 将事件发送到 Kafka
+所有服务实例消费 Kafka 消息，删除本地缓存
+同时更新 Redis 分布式缓存
+优点：
+最可靠，不会遗漏任何数据变更
+完全无侵入，不需要修改业务代码
+支持跨服务的数据同步
+可以处理非应用层的数据变更（如 DBA 直接修改数据库）
+缺点：
+架构最复杂，需要部署 CDC 和 Kafka
+延迟较高（几十到几百毫秒）
+运维成本高
+适用场景：
+核心业务，对一致性要求极高
+有跨服务数据同步需求
+存在非应用层数据变更的情况
+
+
+
+方案 6：中心缓存拉取方案
+核心原理：本地缓存只作为 Redis 的 "加速器"，所有数据都从 Redis 拉取。本地缓存设置很短的过期时间（如 1 秒），定期从 Redis 刷新数据。
+实现步骤：
+java
+运行
+// 使用Caffeine的自动刷新功能
+LoadingCache<String, User> userCache = Caffeine.newBuilder()
+  .maximumSize(10000)
+  .refreshAfterWrite(1, TimeUnit.SECONDS) // 每秒自动刷新
+  .build(key -> {
+    // 从Redis加载数据
+    User user = redisTemplate.opsForValue().get("user:" + key);
+    if (user == null) {
+      // Redis没有，从数据库加载
+      user = userMapper.selectById(key);
+      if (user != null) {
+        redisTemplate.opsForValue().set("user:" + key, user, 30, TimeUnit.MINUTES);
+      }
+    }
+    return user;
+  });
+优点：
+实现简单，不需要消息中间件
+一致性较好，不一致时间窗口等于刷新间隔
+不会出现永久不一致
+缺点：
+本地缓存的性能优势被削弱
+Redis 压力增大
+刷新间隔太短会导致频繁刷新
+适用场景：
+对一致性要求较高，但又不想引入消息中间件
+读多写少的业务
+
+
+
+
+方案 7：本地缓存禁用方案（极端兜底）
+核心原理：直接禁用本地缓存，所有请求都直接访问 Redis。
+优点：
+完全解决一致性问题
+实现最简单
+缺点：
+性能大幅下降，Redis 压力剧增
+失去了本地缓存的所有优势
+适用场景：
+对一致性要求极高，无法容忍任何脏数据
+数据更新非常频繁
+Redis 性能足够支撑所有请求
+

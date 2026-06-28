@@ -1,0 +1,13 @@
+spring:
+  ai:
+    mcp:
+      client:
+        enabled: false
+        name: spring-ai-mcp-client
+        request-timeout: 60s
+        type: SYNC
+        streamable-http:
+          connections:
+            time-server:
+              url: https://mcpmarket.cn
+              endpoint: /mcp/643b32fe55aa9de1b638a5ef

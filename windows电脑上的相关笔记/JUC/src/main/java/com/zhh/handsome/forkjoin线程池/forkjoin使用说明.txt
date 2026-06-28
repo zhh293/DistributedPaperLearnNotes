@@ -1,0 +1,580 @@
+先明确：ForkJoin 使用的核心骨架
+ForkJoin 的使用本质是 “3 个核心组件 + 4 个固定步骤”，先把骨架记牢，后续代码就不会乱：
+核心组件	作用（大白话）	必须做的操作
+ForkJoinPool	专门跑 ForkJoin 任务的线程池（不是普通线程池）	创建它，用来提交 / 执行任务
+RecursiveTask<V>	有返回值的拆分任务（比如求和、求最大值）	继承它，重写compute()方法
+RecursiveAction	无返回值的拆分任务（比如批量打印、批量修改）	继承它，重写compute()方法
+
+
+
+为什么要继承这两个类？因为 ForkJoin 的任务必须实现ForkJoinTask接口
+（这是所有 ForkJoin 任务的父接口），
+而RecursiveTask/RecursiveAction是 JDK 帮我们封装好的子类，
+已经实现了拆分、线程调度的基础逻辑，
+我们只需要重写核心的compute()方法即可，不用从零写。
+
+
+
+步骤 1：先选对任务类 ——RecursiveTask vs RecursiveAction
+首先根据你的需求选任务类，这是第一步，选错了就会错：
+如果你要返回结果（比如计算 1-10000 的和、找数组最大值）→ 用RecursiveTask<V>（V 是返回值类型，比如 Long、Integer）；
+如果你不需要返回结果（比如批量删除文件、批量打印数据）→ 用RecursiveAction；
+👉 我们以最常用的 RecursiveTask（有返回值） 为例讲解（RecursiveAction 只是少了返回值，逻辑完全一样）。
+步骤 2：定义任务类 —— 继承 RecursiveTask，重写 compute ()（核心中的核心）
+这是 ForkJoin 的核心步骤，所有 “拆分 + 计算 + 汇总” 的逻辑都写在compute()方法里。我们用 “计算 1 到 10000 的总和” 这个简单例子，先写任务类，再逐行解释：
+
+
+
+
+
+
+import java.util.concurrent.RecursiveTask;
+
+// 1. 继承RecursiveTask<返回值类型>：这里要返回总和（Long型），所以是RecursiveTask<Long>
+class SumTask extends RecursiveTask<Long> {
+    // 2. 定义两个核心参数：任务的起始值、结束值（比如计算1-10000，start=1，end=10000）
+    private final long start;
+    private final long end;
+
+    // 3. 定义“拆分阈值”：当任务小到这个程度，就不拆了，直接计算（关键！）
+    // 为什么要阈值？如果无限拆（比如拆到每个数算一次），拆分的开销比计算还大，反而慢
+    private static final long THRESHOLD = 1000; // 比如：每个子任务最多算1000个数
+
+    // 4. 构造方法：给任务传起始/结束值
+    public SumTask(long start, long end) {
+        this.start = start;
+        this.end = end;
+    }
+
+    // 5. 重写compute()方法：核心逻辑——拆分+计算+汇总
+    @Override
+    protected Long compute() {
+        // 第一步：判断当前任务是否小到“不用拆”，如果是，直接计算
+        long length = end - start;
+        if (length <= THRESHOLD) {
+            // 直接计算：比如start=1，end=1000，就从1加到1000
+            long sum = 0;
+            for (long i = start; i <= end; i++) {
+                sum += i;
+            }
+            return sum; // 返回当前小任务的计算结果
+        } else {
+            // 第二步：如果任务太大，拆分！
+            long mid = (start + end) / 2; // 拆成两半：比如1-10000拆成1-5000和5001-10000
+
+            // 2.1 创建左子任务（1-mid）和右子任务（mid+1-end）
+            SumTask leftTask = new SumTask(start, mid);
+            SumTask rightTask = new SumTask(mid + 1, end);
+
+            // 2.2 执行子任务：fork() → 把子任务提交到线程池，异步执行
+            // 为什么用fork()？不是直接调用compute()？
+            // fork()会把任务丢给ForkJoinPool的空闲线程执行，实现并行；直接调用compute()就是单线程了
+            leftTask.fork();
+            rightTask.fork();
+
+            // 2.3 汇总结果：join() → 等待子任务执行完成，获取结果
+            // join()是阻塞的，会等子任务干完才拿到结果
+            Long leftResult = leftTask.join();
+            Long rightResult = rightTask.join();
+
+            // 2.4 返回汇总后的结果（左+右）
+            return leftResult + rightResult;
+        }
+    }
+}
+逐行解释核心方法 / 逻辑：
+compute()：必须重写的方法，是 ForkJoin 任务的 “大脑”，里面只做两件事：
+判断当前任务是否需要拆分（用阈值）；
+如果不用拆 → 直接计算返回；如果要拆 → 拆分子任务→执行子任务→汇总结果。
+fork()：把子任务提交到 ForkJoinPool 中，异步执行（不会等子任务干完，主线程继续走）；
+join()：阻塞等待子任务执行完成，并获取子任务的返回值；
+拆分阈值（THRESHOLD）：核心调优点，一般根据 CPU 核心数、任务类型定（比如 CPU 密集型任务，阈值设大一点，减少拆分开销）。
+
+
+
+
+步骤 3：创建 ForkJoinPool 线程池 —— 专门跑 ForkJoin 任务
+为什么不用普通的 ThreadPoolExecutor？因为 ForkJoinPool 内置了 “工作窃取（Work Stealing）” 机制，普通线程池没有这个功能，用了也发挥不了 ForkJoin 的并行优势。
+创建 ForkJoinPool 的方式有 3 种（新手用第一种就行）：
+java
+运行
+import java.util.concurrent.ForkJoinPool;
+
+public class ForkJoinDemo {
+    public static void main(String[] args) {
+        // 方式1：创建默认线程池（线程数=CPU核心数，新手推荐）
+        ForkJoinPool forkJoinPool = new ForkJoinPool();
+
+        // 方式2：指定线程数（比如4线程）
+        // ForkJoinPool forkJoinPool = new ForkJoinPool(4);
+
+        // 方式3：用JDK提供的公共线程池（全局唯一，适合简单场景）
+        // ForkJoinPool forkJoinPool = ForkJoinPool.commonPool();
+
+
+
+
+
+
+
+步骤 4：提交任务到线程池，获取结果
+ForkJoinPool 提交任务有 3 种常用方式，对应不同的需求：
+提交方式	作用（大白话）	适用场景
+invoke(task)	同步提交，等待任务完成并返回结果	要立即拿到结果（比如求和）
+execute(task)	异步提交，不等待结果	不需要立即拿结果（比如批量打印）
+submit(task)	异步提交，返回 Future<V>	后续需要拿结果（可取消）
+
+
+
+
+
+
+
+我们用最常用的invoke()为例，完整代码如下：
+java
+运行
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveTask;
+
+// 第一步：定义拆分任务类
+class SumTask extends RecursiveTask<Long> {
+    private final long start;
+    private final long end;
+    private static final long THRESHOLD = 1000; // 拆分阈值：每个子任务最多算1000个数
+
+    public SumTask(long start, long end) {
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected Long compute() {
+        // 1. 判断是否需要拆分
+        long length = end - start;
+        if (length <= THRESHOLD) {
+            // 不用拆分，直接计算
+            long sum = 0;
+            for (long i = start; i <= end; i++) {
+                sum += i;
+            }
+            return sum;
+        } else {
+            // 2. 需要拆分，拆成左右两个子任务
+            long mid = (start + end) / 2;
+            SumTask leftTask = new SumTask(start, mid);
+            SumTask rightTask = new SumTask(mid + 1, end);
+
+            // 3. 执行子任务（异步）
+            leftTask.fork();
+            rightTask.fork();
+
+            // 4. 汇总子任务结果（阻塞等待）
+            Long leftResult = leftTask.join();
+            Long rightResult = rightTask.join();
+
+            // 5. 返回汇总结果
+            return leftResult + rightResult;
+        }
+    }
+}
+
+// 第二步：创建线程池，提交任务
+public class ForkJoinDemo {
+    public static void main(String[] args) {
+        // 1. 创建ForkJoin线程池
+        ForkJoinPool forkJoinPool = new ForkJoinPool();
+
+        // 2. 创建主任务：计算1-10000的总和
+        SumTask mainTask = new SumTask(1, 10000);
+
+        // 3. 提交任务，同步获取结果
+        Long totalSum = forkJoinPool.invoke(mainTask);
+        System.out.println("1到10000的总和：" + totalSum); // 输出：50005000
+
+        // 4. 关闭线程池（好习惯）
+        forkJoinPool.shutdown();
+    }
+}
+执行流程拆解（帮你理解 “并行计算” 的过程）：
+主任务是 “1-10000 求和”，因为 10000-1=9999 > 阈值 1000，所以拆成 “1-5000” 和 “5001-10000” 两个子任务；
+“1-5000” 还是大于 1000，继续拆成 “1-2500”“2501-5000”；
+直到拆成 “1-1000”“1001-2000”…“9001-10000”（每个子任务 1000 个数）；
+ForkJoinPool 的多个线程并行计算这些小任务（比如线程 1 算 1-1000，线程 2 算 1001-2000…）；
+计算完的小任务结果逐层汇总（1-1000 的结果 + 1001-2000 的结果 = 1-2000 的结果，依此类推）；
+最后汇总成 1-10000 的总和，返回给主线程。
+补充：无返回值的任务（RecursiveAction）怎么用？
+如果你的任务不需要返回结果（比如批量打印 1-10000 的数），只需要把RecursiveTask换成RecursiveAction，去掉返回值即可，核心逻辑不变：
+java
+运行
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
+
+// 无返回值的任务：批量打印数字
+class PrintTask extends RecursiveAction {
+    private final long start;
+    private final long end;
+    private static final long THRESHOLD = 1000;
+
+    public PrintTask(long start, long end) {
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected void compute() {
+        if (end - start <= THRESHOLD) {
+            // 直接打印
+            for (long i = start; i <= end; i++) {
+                System.out.println("打印数字：" + i);
+            }
+        } else {
+            long mid = (start + end) / 2;
+            PrintTask leftTask = new PrintTask(start, mid);
+            PrintTask rightTask = new PrintTask(mid + 1, end);
+            leftTask.fork();
+            rightTask.fork();
+            // 无返回值，不用join()拿结果，但可以用join()等待子任务完成
+            leftTask.join();
+            rightTask.join();
+        }
+    }
+}
+
+// 测试代码
+public class ForkJoinPrintDemo {
+    public static void main(String[] args) {
+        ForkJoinPool pool = new ForkJoinPool();
+        PrintTask task = new PrintTask(1, 10000);
+        pool.invoke(task); // 同步执行，等所有打印完成
+        pool.shutdown();
+    }
+}
+关键问题解答（新手常问）：
+拆分阈值怎么定？
+没有固定值，核心原则：拆分的开销 < 计算的开销；
+比如 CPU 密集型任务（求和、排序），阈值可以设为 1000-10000；IO 密集型任务（文件读写），阈值设小一点（比如 100）；
+可以测试不同阈值，选执行最快的那个。
+fork () 和 join () 能不能换顺序？
+比如先 join () 再 fork ()？不行！
+fork () 是异步提交，join () 是阻塞等待；如果先 join ()，子任务还没提交，会一直阻塞，变成单线程执行，失去并行意义。
+ForkJoinPool 和普通线程池的区别？
+核心区别：ForkJoinPool 有 “工作窃取” 机制 —— 空闲线程会主动偷取其他线程的未完成任务，提高线程利用率；普通线程池没有，空闲线程只会等自己的任务队列。
+总结（核心步骤 + 关键要点）
+核心使用步骤：
+选任务类：有返回值→RecursiveTask<V>，无返回值→RecursiveAction；
+写任务类：继承上述类，重写 compute ()，里面写 “阈值判断→拆分 / 直接计算→汇总（有返回值时）”；
+创建线程池：new ForkJoinPool ()（或指定线程数）；
+提交任务：invoke ()（同步拿结果）/execute ()（异步）/submit ()（异步拿 Future）；
+关闭线程池：shutdown ()。
+关键要点：
+compute () 是核心，只做 “拆分 + 计算 + 汇总” 三件事；
+fork () 异步提交子任务，join () 阻塞等结果；
+拆分阈值是调优关键，避免过度拆分；
+ForkJoinPool 的优势是 “工作窃取”，适合 CPU 密集型的大任务拆分。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+那我有个问题啊，拆分任务这段代码的执行不也需要线程吗，然后这个线程最后还会阻塞直到两个子任务完成，那岂不是说每分割一次就要让一个线程在这里白白等待吗，直到拆分到小于阈值之后才会有线程开始真正干活
+你这个问题问到了 ForkJoin 最核心的 “调度精髓”—— 表面看拆分时线程调用join()会阻塞，好像是 “白白等”，但实际上 ForkJoin 的底层机制（尤其是join()的 “智能等待”+ 工作窃取）完全规避了这个问题，我用 “生活化例子 + 底层机制 + 代码执行流程” 三层拆解，把这个点讲透，你就知道为什么不是 “白白等待” 了。
+先给结论：你的担心 “看似有理，实则不然”
+拆分任务的线程不是 “白白等待”，因为 ForkJoin 的join()不是普通线程的 “傻等阻塞”，而是 “智能等待”—— 当前线程在等子任务的同时，会去偷其他未执行的任务来干，直到自己等的子任务完成；而且拆分过程本身极快（只是创建对象、算 mid 值），几乎不占用线程资源，完全不会出现 “线程空等” 的情况。
+第一步：用 “包工头分工” 的例子，先理解核心逻辑
+咱把 ForkJoin 的线程比作 “包工头 + 工人”，任务拆分比作 “分工”，阈值比作 “最小干活单元”（比如 1000 个活）：
+场景：包工头（线程 A）接到 “干 10000 个活” 的任务，阈值是 1000；
+第一步：包工头 A 一看活太多，要拆分→拆成 5000+5000，喊两个工人（子任务）来干；
+关键：包工头 A 喊完工人后，不是站在原地等工人干完，而是自己也去干活 —— 比如去帮工人拆 5000 的活，或者去偷其他包工头没干完的活；
+直到拆到 “1000 个活”（阈值），所有工人（包括包工头自己）才开始干具体的活；
+最后：等自己负责的小活干完，再汇总其他工人的结果。
+👉 核心：拆分的线程（包工头）不是 “空等”，而是 “边等边干活”，这是 ForkJoin 和普通线程阻塞的本质区别。
+第二步：拆解 ForkJoin 的join()底层机制 ——“智能等待” 而非 “傻等”
+普通线程的join()（比如Thread.join()）是真阻塞：线程暂停，啥也不干，直到目标线程完成；但 ForkJoinTask 的join()是 **“忙等（Busy Waiting）+ 工作窃取”**，底层逻辑简化如下：
+java
+运行
+// ForkJoinTask.join()的核心逻辑（简化版）
+public V join() {
+    while (子任务还没完成) {
+        // 不是傻等，而是去任务队列里“偷”其他任务来执行
+        ForkJoinTask<?> task = 当前线程的工作队列.poll();
+        if (task != null) {
+            task.compute(); // 执行偷来的任务
+        }
+    }
+    return 子任务的结果;
+}
+也就是说，当线程调用join()等待子任务时，它会：
+先检查子任务是否完成→如果完成，直接拿结果；
+如果没完成→不去休眠，而是去 ForkJoinPool 的 “任务队列” 里偷其他未执行的任务（比如其他线程拆分出来的子任务）执行；
+直到自己等的子任务完成，才停止偷活，返回结果。
+这就彻底避免了 “线程白白等待” 的问题 —— 线程的 CPU 时间片全用在干活上，没有闲置。
+第三步：结合代码执行流程，逐行看 “拆分 + 执行” 的线程调度（最关键）
+我们回到之前 “1-10000 求和” 的代码，用具体的线程执行过程，看拆分时线程到底在干嘛：
+初始状态
+ForkJoinPool 创建 4 个线程（假设 CPU 是 4 核）：线程 A、B、C、D；
+主任务 “1-10000 求和” 提交给线程 A 执行。
+第一步：线程 A 执行 compute ()，开始拆分
+java
+运行
+// 线程A执行这段代码
+if (end - start <= THRESHOLD) { // 10000-1=9999 > 1000，进入else
+    // 拆分逻辑
+    long mid = (1+10000)/2 = 5000;
+    SumTask leftTask = new SumTask(1, 5000); // 左子任务
+    SumTask rightTask = new SumTask(5001, 10000); // 右子任务
+
+    leftTask.fork(); // 把左子任务放到线程池的任务队列
+    rightTask.fork(); // 把右子任务放到线程池的任务队列
+
+    // 调用join()，关键！
+    Long leftResult = leftTask.join();
+    Long rightResult = rightTask.join();
+    return leftResult + rightResult;
+}
+第二步：线程 A 调用 leftTask.join ()，触发 “智能等待”
+线程 A 检查 leftTask（1-5000）是否完成→此时 leftTask 刚被 fork，还没执行，没完成；
+线程 A 不傻等，而是去线程池的任务队列里 “偷活”→刚好看到 rightTask（5001-10000）还没被执行，就把 rightTask 拿过来执行；
+线程 A 执行 rightTask 的 compute ()→发现 5001-10000 也大于 1000，继续拆分：拆成 5001-7500 和 7501-10000，fork 出去；
+线程 A 调用 rightTask 子任务的 join ()，又触发智能等待→继续偷活，直到拆到 “阈值级任务”（比如 7501-8500），开始执行具体的求和计算；
+第三步：其他线程也在 “抢活干”
+线程 B、C、D 发现任务队列里有 leftTask（1-5000）、5001-7500 等子任务，会主动 “偷” 过来执行；
+这些线程执行子任务时，同样是 “拆到阈值→执行计算”，不会空等；
+第四步：所有阈值级任务执行完，逐层汇总
+线程 A 干完 7501-8500 的求和，拿到结果后，回到之前的 join ()，此时它等的 rightTask 子任务可能已经被线程 B 干完了，直接拿结果；
+线程 A 汇总 5001-10000 的结果，再回到最开始的 join ()，此时 leftTask（1-5000）可能已经被线程 C 干完了，拿到结果；
+最后线程 A 汇总 1-5000+5001-10000 的结果，返回给主线程。
+👉 整个过程：没有任何线程在 “白白等待” —— 拆分的线程在 join () 时，要么在拆更小的任务，要么在执行偷来的任务，直到拆到阈值才执行具体计算，所有线程的 CPU 时间都被充分利用。
+第四步：再澄清两个关键误区
+误区 1：“拆分任务需要线程，每拆分一次就占用一个线程”
+拆分任务的代码（创建子任务、算 mid 值）是CPU 极轻量的操作，耗时微秒级，几乎可以忽略；
+拆分本身只是 “创建任务对象”，不是 “占用线程执行耗时操作”，所以就算线程花一点时间拆分，也完全不浪费。
+误区 2：“必须拆到阈值，线程才会开始干活”
+不是 “只有拆到阈值才干活”，而是 “拆到阈值才开始干‘具体的计算活’”；
+拆分的过程本身就是 “干活”（线程在执行 compute () 里的拆分逻辑），只是这个活很轻量；
+而且拆分和计算是并行的：线程 A 在拆 1-10000 的同时，线程 B 已经在拆 1-5000 并执行 1-1000 的计算了。
+第五步：用一个极简的实验验证 —— 看线程是否真的在 “干活”
+我们给代码加一点日志，打印每个线程执行的任务，就能看到线程不会空等：
+java
+运行
+class SumTask extends RecursiveTask<Long> {
+    // 省略之前的参数和构造方法
+
+    @Override
+    protected Long compute() {
+        long length = end - start;
+        // 打印当前线程和执行的任务
+        System.out.println(Thread.currentThread().getName() + " 处理任务：" + start + "-" + end);
+
+        if (length <= THRESHOLD) {
+            long sum = 0;
+            for (long i = start; i <= end; i++) {
+                sum += i;
+            }
+            System.out.println(Thread.currentThread().getName() + " 完成计算：" + start + "-" + end + " = " + sum);
+            return sum;
+        } else {
+            long mid = (start + end) / 2;
+            SumTask leftTask = new SumTask(start, mid);
+            SumTask rightTask = new SumTask(mid + 1, end);
+
+            leftTask.fork();
+            rightTask.fork();
+
+            Long leftResult = leftTask.join();
+            Long rightResult = rightTask.join();
+
+            System.out.println(Thread.currentThread().getName() + " 汇总：" + start + "-" + mid + " + " + (mid+1) + "-" + end + " = " + (leftResult+rightResult));
+            return leftResult + rightResult;
+        }
+    }
+}
+
+// 测试代码
+public class ForkJoinDemo {
+    public static void main(String[] args) {
+        ForkJoinPool pool = new ForkJoinPool(2); // 只创建2个线程，方便观察
+        SumTask task = new SumTask(1, 10000);
+        Long total = pool.invoke(task);
+        System.out.println("最终结果：" + total);
+        pool.shutdown();
+    }
+}
+输出结果（关键片段）：
+plaintext
+ForkJoinPool-1-worker-0 处理任务：1-10000
+ForkJoinPool-1-worker-1 处理任务：1-5000  // worker1偷了leftTask
+ForkJoinPool-1-worker-0 处理任务：5001-10000 // worker0执行rightTask
+ForkJoinPool-1-worker-1 处理任务：1-2500
+ForkJoinPool-1-worker-0 处理任务：5001-7500
+ForkJoinPool-1-worker-1 处理任务：1-1250
+ForkJoinPool-1-worker-0 处理任务：5001-6250
+ForkJoinPool-1-worker-1 完成计算：1-1000 = 500500 // 拆到阈值，开始计算
+ForkJoinPool-1-worker-0 完成计算：5001-6000 = 5500500
+...（中间都是计算和汇总）
+ForkJoinPool-1-worker-0 汇总：5001-10000 = 37502500
+ForkJoinPool-1-worker-1 汇总：1-5000 = 12502500
+ForkJoinPool-1-worker-0 汇总：1-10000 = 50005000
+最终结果：50005000
+从日志能清晰看到：
+两个线程（worker0、worker1）一直在 “处理任务”（拆分或计算），没有任何线程处于 “空等” 状态；
+拆分和计算是并行的，线程 0 拆 5001-10000 的同时，线程 1 拆 1-5000，拆到阈值后立刻开始计算。
+总结（核心要点）
+join () 不是傻等：ForkJoin 的 join () 是 “智能等待”，线程在等子任务时会去偷其他任务执行，不会白白闲置；
+拆分极轻量：拆分任务的代码只是创建对象、算 mid 值，耗时可忽略，不会占用线程大量时间；
+拆分和计算并行：线程拆分大任务的同时，其他线程已经在拆更小的任务甚至执行计算，不是 “等所有拆分完才干活”；
+工作窃取是关键：ForkJoinPool 的核心优势就是让空闲线程偷活干，彻底避免了 “线程空等” 的问题。
+你这个问题其实戳中了 ForkJoin 的设计精髓 —— 看似有 “阻塞”，但通过 “工作窃取 + 智能等待” 把阻塞的时间变成了 “干活的时间”，这也是它比普通线程池更适合拆分任务的根本原因～
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ForkJoinPool-1-worker-1 处理任务：1-10000
+ForkJoinPool-1-worker-2 处理任务：1-5000
+ForkJoinPool-1-worker-2 处理任务：1-2500
+ForkJoinPool-1-worker-2 处理任务：1-1250
+ForkJoinPool-1-worker-2 处理任务：1-625
+ForkJoinPool-1-worker-2 完成计算：1-625 = 195625
+ForkJoinPool-1-worker-2 处理任务：626-1250
+ForkJoinPool-1-worker-2 完成计算：626-1250 = 586250
+ForkJoinPool-1-worker-2 汇总：1-625 + 626-1250 = 781875
+ForkJoinPool-1-worker-2 处理任务：1251-2500
+ForkJoinPool-1-worker-2 处理任务：1251-1875
+ForkJoinPool-1-worker-2 完成计算：1251-1875 = 976875
+ForkJoinPool-1-worker-2 处理任务：1876-2500
+ForkJoinPool-1-worker-2 完成计算：1876-2500 = 1367500
+ForkJoinPool-1-worker-2 汇总：1251-1875 + 1876-2500 = 2344375
+ForkJoinPool-1-worker-2 汇总：1-1250 + 1251-2500 = 3126250
+ForkJoinPool-1-worker-2 处理任务：2501-5000
+ForkJoinPool-1-worker-2 处理任务：2501-3750
+ForkJoinPool-1-worker-2 处理任务：2501-3125
+ForkJoinPool-1-worker-2 完成计算：2501-3125 = 1758125
+ForkJoinPool-1-worker-2 处理任务：3126-3750
+ForkJoinPool-1-worker-2 完成计算：3126-3750 = 2148750
+ForkJoinPool-1-worker-2 汇总：2501-3125 + 3126-3750 = 3906875
+ForkJoinPool-1-worker-2 处理任务：3751-5000
+ForkJoinPool-1-worker-2 处理任务：3751-4375
+ForkJoinPool-1-worker-2 完成计算：3751-4375 = 2539375
+ForkJoinPool-1-worker-2 处理任务：4376-5000
+ForkJoinPool-1-worker-2 完成计算：4376-5000 = 2930000
+ForkJoinPool-1-worker-2 汇总：3751-4375 + 4376-5000 = 5469375
+ForkJoinPool-1-worker-2 汇总：2501-3750 + 3751-5000 = 9376250
+ForkJoinPool-1-worker-2 汇总：1-2500 + 2501-5000 = 12502500
+ForkJoinPool-1-worker-2 处理任务：5001-10000
+ForkJoinPool-1-worker-2 处理任务：5001-7500
+ForkJoinPool-1-worker-2 处理任务：5001-6250
+ForkJoinPool-1-worker-2 处理任务：5001-5625
+ForkJoinPool-1-worker-2 完成计算：5001-5625 = 3320625
+ForkJoinPool-1-worker-2 处理任务：5626-6250
+ForkJoinPool-1-worker-2 完成计算：5626-6250 = 3711250
+ForkJoinPool-1-worker-2 汇总：5001-5625 + 5626-6250 = 7031875
+ForkJoinPool-1-worker-2 处理任务：6251-7500
+ForkJoinPool-1-worker-2 处理任务：6251-6875
+ForkJoinPool-1-worker-2 完成计算：6251-6875 = 4101875
+ForkJoinPool-1-worker-2 处理任务：6876-7500
+ForkJoinPool-1-worker-2 完成计算：6876-7500 = 4492500
+ForkJoinPool-1-worker-2 汇总：6251-6875 + 6876-7500 = 8594375
+ForkJoinPool-1-worker-2 汇总：5001-6250 + 6251-7500 = 15626250
+ForkJoinPool-1-worker-2 处理任务：7501-10000
+ForkJoinPool-1-worker-2 处理任务：7501-8750
+ForkJoinPool-1-worker-2 处理任务：7501-8125
+ForkJoinPool-1-worker-2 完成计算：7501-8125 = 4883125
+ForkJoinPool-1-worker-2 处理任务：8126-8750
+ForkJoinPool-1-worker-2 完成计算：8126-8750 = 5273750
+ForkJoinPool-1-worker-2 汇总：7501-8125 + 8126-8750 = 10156875
+ForkJoinPool-1-worker-2 处理任务：8751-10000
+ForkJoinPool-1-worker-2 处理任务：8751-9375
+ForkJoinPool-1-worker-2 完成计算：8751-9375 = 5664375
+ForkJoinPool-1-worker-2 处理任务：9376-10000
+ForkJoinPool-1-worker-2 完成计算：9376-10000 = 6055000
+ForkJoinPool-1-worker-2 汇总：8751-9375 + 9376-10000 = 11719375
+ForkJoinPool-1-worker-2 汇总：7501-8750 + 8751-10000 = 21876250
+ForkJoinPool-1-worker-2 汇总：5001-7500 + 7501-10000 = 37502500
+ForkJoinPool-1-worker-1 汇总：1-5000 + 5001-10000 = 50005000
+最终结果：50005000
+
+按上述结果看的话，好像线程一会死等而不干活，其实非也。
+
+worker-2 把所有子任务都 “抢光了”，worker-1 想偷活都没的偷，只能等 worker-2 干完 —— 这不是 worker-1 “傻等”，是 “没任务可偷的被动等待”，和 ForkJoin 的join()机制无关，是任务提交 / 偷取的策略导致的。
+
+第二步：分析 “worker-1 没活可偷” 的 3 个核心原因
+ForkJoin 的 “工作窃取” 遵循「本地队列 + 偷取策略」，你的场景刚好触发了 “单线程抢光所有任务” 的情况：
+原因 1：ForkJoin 的任务队列是 “线程本地队列（LQ）+ 全局队列”，偷取有优先级
+ForkJoinPool 里的每个线程都有自己的「本地任务队列（LQ）」，规则是：
+线程自己 fork 的任务，优先放到自己的本地队列里；
+其他线程偷任务时，优先偷 “全局队列” 或其他线程本地队列的 “尾部任务”；
+你的代码里，worker-1 fork 出 1-5000 和 5001-10000 后，这两个任务先放到 worker-1 的本地队列；
+worker-2 “手快”，直接偷了 worker-1 本地队列里的 1-5000（尾部任务），而且干完 1-5000 后，又立刻偷了 5001-10000—— 全程 worker-1 的本地队列里没剩下任何任务，worker-1 想偷活都没的偷。
+原因 2：任务拆分的 “粒度太细”，worker-2 “干得太快”
+你的阈值应该设得比较小（比如 625），导致 1-5000 拆成的子任务都很小，worker-2 能 “一口气干完”，worker-1 还没来得及去偷其他任务，worker-2 已经把下一个子任务（5001-10000）抢了。就像两个工人，工人 A 刚把活放到桌上，工人 B 立刻全拿走了，工人 A 只能站着等。
+
+
+
+
+改完之后结果就成了这样，合理了
+ForkJoinPool-1-worker-1 处理任务：1-10000
+ForkJoinPool-1-worker-1 处理任务：1-5000
+ForkJoinPool-1-worker-1 处理任务：1-2500
+ForkJoinPool-1-worker-2 处理任务：5001-10000
+ForkJoinPool-1-worker-2 处理任务：5001-7500
+ForkJoinPool-1-worker-1 完成计算：1-2500 = 3126250
+ForkJoinPool-1-worker-2 完成计算：5001-7500 = 15626250
+ForkJoinPool-1-worker-1 处理任务：2501-5000
+ForkJoinPool-1-worker-2 处理任务：7501-10000
+ForkJoinPool-1-worker-1 完成计算：2501-5000 = 9376250
+ForkJoinPool-1-worker-2 完成计算：7501-10000 = 21876250
+ForkJoinPool-1-worker-2 汇总：5001-7500 + 7501-10000 = 37502500
+ForkJoinPool-1-worker-1 汇总：1-2500 + 2501-5000 = 12502500
+ForkJoinPool-1-worker-1 汇总：1-5000 + 5001-10000 = 50005000
+最终结果：50005000
+
+
+
+
+
+
+
+
+简单说：worker-1 不是 “躺平等”，是 “站在任务队列前等活，只是暂时没活可干”—— 只要有任务，它会立刻去干；而普通线程的傻等是 “直接躺倒，CPU 叫都叫不醒”。
+总结（核心结论 + 给你的面试 / 使用建议）
+你的观察是对的：从日志看 worker-1 确实全程等，但这不是 ForkJoin 的join()傻等，是「任务被 worker-2 抢光 + 代码提交方式」导致 worker-1 没活可偷；
+ForkJoin 的机制没问题：join()的 “智能等待” 是 “边偷活边等”，只是你的场景没给它偷活的机会；
+使用建议（面试 / 实战都能用）：
+不要 “一次性 fork 所有子任务”，可以让当前线程先执行一个子任务（rightTask.compute()），再 fork 另一个；
+阈值要合理（别太小），避免拆分层级太多，导致一个线程抢光所有小任务；
+线程池大小建议设为 CPU 核心数（默认就是），太少会没线程偷活，太多会增加切换开销。

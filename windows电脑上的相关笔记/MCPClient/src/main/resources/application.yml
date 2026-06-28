@@ -1,0 +1,35 @@
+
+
+
+spring:
+  application:
+    name: MCPClient
+  ai:
+    openai:
+      base-url: https://api.xty.app
+      api-key: sk-e5zWuv9LGJfOAiwJMqREqqRli8AJ8hc8eU69AW3MxY5sC2cN
+      embedding:
+        options:
+          dimensions: 1536
+          model: text-embedding-3-small
+      image:
+        options:
+          height: 512
+          width: 256
+
+    mcp:
+      client:
+        type: sync
+        request-timeout: 20s
+        enabled: true
+        streamable-http:
+          connections:
+            time-server:
+              url: https://mcpmarket.cn
+              endpoint: /mcp/643b32fe55aa9de1b638a5ef
+
+
+#  spring.ai.openai.embedding.options.model=text-embedding-3-small
+#  spring.ai.openai.embedding.options.dimensions=1536
+server:
+  port: 8082

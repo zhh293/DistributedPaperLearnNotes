@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: zhh-ai
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: deepseek-r1:7b
+      embedding:
+        model: deepseek-r1:7b
+    openai:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode
+
+
+    #datasource:
+   # druid:
+    #  driver-class-name: com.mysql.cj.jdbc.Driver
+     # url: jdbc:mysql://localhost:3306/zhh-ai?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+      #username: root
+      #password: zhang20061023@
+      #host: localhost
+      #port: 3306
+      api-key: sk-d88586a4d04744c2a0fea3a0e2841aca
+      chat:
+        options:
+          model: qwen-max-latest
+          temperature: 0.8
+
+  datasource:
+    url: jdbc:mysql://localhost:3306/itheima?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: zhang20061023@
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+logging:
+    level:
+      org.springframework.ai.chat.client.advisor: debug
+      org.example.springai1: debug
+
+
+
+# https://springdoc.cn/spring-ai/index.html

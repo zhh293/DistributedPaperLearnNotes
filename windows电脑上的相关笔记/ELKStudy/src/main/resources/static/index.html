@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ELK高亮搜索系统</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .feature-card {
+            background-color: #f9f9f9;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .feature-title {
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 10px;
+        }
+        
+        .feature-desc {
+            color: #666;
+            margin-bottom: 15px;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        .btn:hover {
+            background-color: #0056b3;
+        }
+        
+        .api-list {
+            margin-top: 20px;
+        }
+        
+        .api-item {
+            background-color: #f0f8ff;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ELK高亮搜索系统</h1>
+        
+        <div class="feature-card">
+            <div class="feature-title">高亮搜索功能</div>
+            <div class="feature-desc">支持在搜索结果中高亮显示匹配的关键字，便于用户快速定位相关内容。</div>
+            <a href="/highlight-search.html" class="btn">进入高亮搜索页面</a>
+        </div>
+        
+        <div class="feature-card">
+            <div class="feature-title">API 接口说明</div>
+            <div class="api-list">
+                <div class="api-item">
+                    <strong>全文高亮搜索:</strong> GET /es/highlight/search/match/{indexName}/{fieldName}/{value}?highlightFields={fields}
+                </div>
+                <div class="api-item">
+                    <strong>精确高亮搜索:</strong> GET /es/highlight/search/term/{indexName}/{fieldName}/{value}?highlightFields={fields}
+                </div>
+                <div class="api-item">
+                    <strong>多字段高亮搜索:</strong> GET /es/highlight/search/multi/{indexName}/{value}?searchFields={fields}&highlightFields={fields}
+                </div>
+                <div class="api-item">
+                    <strong>分页高亮搜索:</strong> GET /es/highlight/search/paginated/{indexName}?query={query}&searchFields={fields}&highlightFields={fields}&page={page}&size={size}
+                </div>
+            </div>
+        </div>
+        
+        <div class="feature-card">
+            <div class="feature-title">功能特点</div>
+            <ul>
+                <li>支持多种搜索模式：全文搜索、精确搜索、多字段搜索</li>
+                <li>可自定义高亮字段</li>
+                <li>前端实时展示高亮效果</li>
+                <li>支持分页查询</li>
+                <li>灵活的高亮样式定制</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

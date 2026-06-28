@@ -1,0 +1,319 @@
+ReentrantLock 的所有方法，最终都是「委托给内部 Sync」，而 Sync 继承 AQS，调用 AQS 的核心方法（acquire、release 等），
+同时重写 AQS 的 tryAcquire/tryRelease 等方法定制 “可重入锁” 规则。
+
+acquire和release方法中分别调用了 tryAcquire和tryRelease方法，所以重写方法影响的就是这一部分，但是acquire和release方法的其他逻辑是影响不到的
+
+
+看源码就知道了
+
+
+
+
+
+第二步：结合源码讲 ReentrantLock 的核心方法（分两类：Lock 接口方法 + 特有方法）
+第一类：实现 Lock 接口的核心方法（必须掌握）
+1. lock ()：加锁（最常用）
+作用：获取锁，抢不到就阻塞，直到拿到锁（可重入）。
+ReentrantLock 源码实现：
+java
+运行
+public void lock() {
+    sync.lock(); // 委托给Sync的lock方法，分公平/非公平
+}
+底层细分（非公平锁 vs 公平锁）：
+非公平锁（NonfairSync）的 lock () 源码（核心是 “插队抢锁”）：
+java
+运行
+final void lock() {
+    // 第一步：先CAS抢锁（state从0→1），插队！
+    if (compareAndSetState(0, 1))
+        setExclusiveOwnerThread(Thread.currentThread()); // 标记当前线程拿到锁
+    else
+        // 第二步：抢不到，走AQS的acquire方法（入队阻塞）
+        acquire(1);
+}
+👉 通俗解释：非公平锁像 “插队加塞”，先直接抢，抢不到再排队，效率更高（默认用这个）。
+公平锁（FairSync）的 lock () 源码（核心是 “排队不插队”）：
+java
+运行
+final void lock() {
+    // 直接走AQS的acquire方法，先排队，不插队
+    acquire(1);
+}
+👉 通俗解释：公平锁像 “老老实实排队”，不管能不能抢，先去队列尾等着，保证线程顺序。
+AQS 的 acquire (1) 核心逻辑（不用记源码，记流程）：
+plaintext
+1. 调用tryAcquire(1)（ReentrantLock重写的方法）尝试抢锁；
+2. 抢不到→创建节点加入CLH队列；
+3. 阻塞当前线程，直到被唤醒后重新抢锁。
+
+
+
+
+
+事实上，真正的源码也是上述逻辑，只不过代码写的更加规范罢了
+上述是否尝试修改state的操作在源码中是这么写的
+
+
+Sync抽象类中
+final void lock() {
+            if (!initialTryLock())
+                acquire(1);
+        }
+
+abstract boolean initialTryLock();
+
+
+实现类中的initial方法是这么重写的
+static final class NonfairSync extends Sync {
+        private static final long serialVersionUID = 7316153563782823691L;
+
+        final boolean initialTryLock() {
+            Thread current = Thread.currentThread();
+            if (compareAndSetState(0, 1)) { // first attempt is unguarded
+                setExclusiveOwnerThread(current);
+                return true;
+            } else if (getExclusiveOwnerThread() == current) {
+                int c = getState() + 1;
+                if (c < 0) // overflow
+                    throw new Error("Maximum lock count exceeded");
+                setState(c);
+                return true;
+            } else
+                return false;
+        }
+  }
+
+
+
+
+static final class FairSync extends Sync {
+        private static final long serialVersionUID = -3000897897090466540L;
+
+        /**
+         * Acquires only if reentrant or queue is empty.
+         */
+        final boolean initialTryLock() {
+            Thread current = Thread.currentThread();
+            int c = getState();
+            if (c == 0) {
+                if (!hasQueuedThreads() && compareAndSetState(0, 1)) {
+                    setExclusiveOwnerThread(current);
+                    return true;
+                }
+            } else if (getExclusiveOwnerThread() == current) {
+                if (++c < 0) // overflow
+                    throw new Error("Maximum lock count exceeded");
+                setState(c);
+                return true;
+            }
+            return false;
+        }
+ }
+
+
+
+2. lockInterruptibly ()：可中断加锁
+作用：获取锁，抢不到就阻塞，但支持「线程中断」（中断后抛异常，停止等待）—— 解决 synchronized “死等” 的痛点。
+ReentrantLock 源码实现：
+java
+运行
+public void lockInterruptibly() throws InterruptedException {
+    sync.acquireInterruptibly(1); // 调用AQS的acquireInterruptibly
+}
+核心区别：和 lock () 比，这个方法如果线程被interrupt()，会立刻抛出InterruptedException，不再阻塞等待。
+使用场景：需要 “超时 / 中断” 控制的场景（比如抢锁超过 10 秒就放弃）。
+
+
+
+
+3. tryLock ()：非阻塞式抢锁
+作用：尝试抢锁，抢到返回 true，没抢到返回 false（不阻塞，立刻返回）。
+ReentrantLock 源码实现：
+java
+运行
+public boolean tryLock() {
+    // 调用Sync的非公平抢锁方法（不管公平锁还是非公平锁，tryLock都是非公平），即公平锁和非公平锁这段的逻辑都是这样的,所以直接在sync抽象类中直接写好逻辑就行了，继承类不用再重写。符合设计模式中的单一职责原则
+    return sync.tryLock(1);
+}
+nonfairTryAcquire (1) 核心源码（可重入的关键）：
+java
+运行
+final boolean tryLock(int acquires) {
+    final Thread current = Thread.currentThread();
+    int c = getState(); // 获取AQS的state（0=无锁，>0=有锁）
+    // 情况1：无锁，CAS抢锁
+    if (c == 0) {
+        if (compareAndSetState(0, acquires)) {
+            setExclusiveOwnerThread(current);
+            return true;
+        }
+    }
+    // 情况2：有锁，但当前线程是持有锁的线程（可重入）
+    else if (current == getExclusiveOwnerThread()) {
+        int nextc = c + acquires; // state递增（重入一次+1）
+        if (nextc < 0) // 溢出保护
+            throw new Error("Maximum lock count exceeded");
+        setState(nextc); // 更新state
+        return true;
+    }
+    // 情况3：有锁，且不是当前线程→抢不到
+    return false;
+}
+👉 通俗解释：可重入的核心是 “认线程”—— 只要是自己持有的锁，就允许重复加锁，state 计数递增（比如加 2 次锁，state=2）。
+
+
+
+
+4. tryLock (long timeout, TimeUnit unit)：超时抢锁
+作用：在指定时间内尝试抢锁，抢到返回 true，超时 / 被中断返回 false。
+ReentrantLock 源码实现：
+java
+运行
+public boolean tryLock(long timeout, TimeUnit unit) throws InterruptedException {
+    // 调用AQS的tryAcquireNanos，传入超时时间
+    return sync.tryAcquireNanos(1, unit.toNanos(timeout));
+}
+核心优势：避免线程无限阻塞，比如 “抢锁超过 5 秒就放弃”，防止死锁。
+
+
+
+
+
+
+
+
+
+
+5. unlock ()：释放锁
+作用：释放锁，可重入锁需要释放次数和加锁次数一致（比如加 2 次锁，要释放 2 次）。
+ReentrantLock 源码实现：
+java
+运行
+public void unlock() {
+    sync.release(1); // 调用AQS的release方法
+}
+AQS 的 release (1) 核心逻辑：
+调用 tryRelease (1)（ReentrantLock 重写的方法）释放锁；
+释放成功（state=0）→唤醒 CLH 队列头的线程；
+返回释放结果。
+tryRelease (1) 核心源码（可重入释放的关键）：
+java
+运行
+protected final boolean tryRelease(int releases) {
+    int c = getState() - releases; // state递减（释放一次-1）
+    // 检查：只有持有锁的线程才能释放
+    if (Thread.currentThread() != getExclusiveOwnerThread())
+        throw new IllegalMonitorStateException();
+    boolean free = false;
+    // 只有state减到0，才算完全释放锁
+    if (c == 0) {
+        free = true;
+        setExclusiveOwnerThread(null); // 清空持有锁的线程
+    }
+    setState(c); // 更新state
+    return free;
+}
+👉 通俗解释：比如你加了 2 次锁（state=2），第一次 unlock→state=1（没完全释放），第二次 unlock→state=0（完全释放，唤醒排队线程）。
+
+
+
+
+6. newCondition ()：创建条件队列
+作用：创建一个 Condition（条件队列），实现 “精准唤醒”（比 Object.wait ()/notify () 灵活）。
+ReentrantLock 源码实现：
+java
+运行
+public Condition newCondition() {
+    return sync.new ConditionObject(); // ConditionObject是AQS的内部类
+}
+核心优势：一个锁可以创建多个 Condition，比如生产者消费者模型中，创建 “生产条件” 和 “消费条件”，精准唤醒生产者 / 消费者，而 synchronized 只有一个条件队列。
+
+
+
+
+
+第二类：ReentrantLock 的特有方法（面试常问）
+1. isFair ()：判断是否为公平锁
+源码：
+java
+运行
+public boolean isFair() {
+    return sync instanceof FairSync; // 判断Sync是不是FairSync实例
+}
+作用：区分当前锁是公平 / 非公平（默认非公平）。
+2. getHoldCount ()：获取当前线程的重入次数
+源码：
+java
+运行
+public int getHoldCount() {
+    return sync.getHoldCount(); // 调用AQS的getHoldCount
+}
+作用：比如线程加了 3 次锁，返回 3；没加锁返回 0—— 用于排查 “重入次数过多导致锁无法释放” 的问题。
+3. isLocked ()：判断锁是否被任意线程持有
+源码：
+java
+运行
+public boolean isLocked() {
+    return sync.isHeldExclusively(); // 调用AQS的方法
+}
+区别：和 Thread.holdsLock () 比，这个方法可以判断 “任意线程” 是否持有锁，而 Thread.holdsLock () 只能判断 “当前线程”。
+第三步：重点讲 ReentrantLock 的 “可重入” 实现（AQS 的 state 变量是核心）
+可重入是 ReentrantLock 的核心特性，底层全靠 AQS 的state变量实现，结合源码再梳理一遍：
+加锁时：
+第一次加锁：state=0→CAS 改成 1，标记当前线程为持有线程；
+重入加锁：判断当前线程是持有线程→state+1（比如重入 2 次→state=2）；
+释放时：
+每次释放：state-1；
+只有 state 减到 0，才算完全释放锁，清空持有线程，唤醒排队线程。
+源码验证（nonfairTryAcquire）：
+java
+运行
+final boolean nonfairTryAcquire(int acquires) {
+    final Thread current = Thread.currentThread();
+    int c = getState();
+    if (c == 0) { // 第一次加锁
+        if (compareAndSetState(0, acquires)) {
+            setExclusiveOwnerThread(current);
+            return true;
+        }
+    }
+    else if (current == getExclusiveOwnerThread()) { // 重入加锁
+        int nextc = c + acquires;
+        if (nextc < 0) // 溢出保护
+            throw new Error("Maximum lock count exceeded");
+        setState(nextc);
+        return true;
+    }
+    return false;
+}
+总结（核心梳理，帮你记牢）
+层级关系：
+Lock 接口是 “锁规范”，定义 lock/unlock 等方法；
+AQS 是 “锁骨架”，封装 state / 队列 / 阻塞逻辑；
+ReentrantLock 实现 Lock 接口，内部通过 Sync（继承 AQS）定制 “可重入独占锁” 规则。
+核心方法逻辑：
+lock ()：委托 Sync，非公平锁先 CAS 插队，公平锁直接排队；
+tryLock ()：非阻塞抢锁，支持可重入；
+unlock ()：委托 AQS 的 release，state 递减，减到 0 才完全释放；
+lockInterruptibly ()/tryLock (timeout)：支持中断 / 超时，解决 synchronized 死等问题。
+可重入核心：
+靠 AQS 的 state 变量计数，加锁递增，释放递减，state=0 才算完全释放。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,104 @@
+🛠️ 一、settings 核心定位
+作用范围：针对整个索引（或索引模板），是全局配置，而非单个字段。
+主要职责：定义索引的物理结构、性能策略、自定义分析器等，直接影响索引的写入速度、查询性能、可靠性。
+可修改性：部分配置（如副本数、刷新间隔）支持动态修改，但核心配置（如主分片数）一旦创建就无法修改。
+
+
+📋 二、常用 settings 配置分类详解
+1. 🔹 基础核心配置（不可 / 动态修改）
+这是创建索引时必须或最常配置的选项，决定了索引的基本结构。
+属性	作用	可修改性	示例
+number_of_shards	设置索引的主分片数量，决定了数据的拆分方式（和之前讲的分片路由直接相关）。
+⚠️ 一旦创建索引，此值永远无法修改，因为它是哈希取模的分母，修改会导致所有数据路由失效。	❌ 不可修改	"number_of_shards": 3（对应你图中的 3 个主分片）
+number_of_replicas	设置每个主分片的副本数量，副本用于故障恢复和读请求负载均衡。
+生产环境建议设为 1 或以上，保证高可用。	✅ 动态修改	"number_of_replicas": 2（对应你图中每个主分片有 2 个副本）
+2. 🔹 性能优化配置（动态可调）
+这类配置直接影响写入、查询的性能，是生产环境调优的重点。
+属性	作用	示例
+refresh_interval	控制索引的刷新间隔，即内存中的数据多久被写入到可搜索的段（segment）中。
+默认 1s（近实时搜索），如果追求写入性能，可调大（如 30s）；如果追求实时性，保持默认。	"refresh_interval": "30s"
+translog.durability	控制事务日志（translog）的持久化策略：
+- request（默认）：每次写入请求都刷盘，可靠性最高但写入性能稍差；
+- async：异步刷盘，写入性能更高但存在小概率数据丢失风险。	"translog.durability": "async"
+translog.flush_threshold_size	当事务日志达到指定大小（默认 512MB）时，触发一次刷盘操作。	"translog.flush_threshold_size": "1gb"
+index.max_result_window	控制 from + size 分页的最大结果数（默认 10000），避免深分页导致的内存溢出。
+如果需要更大的分页，建议用 search_after 替代。	"index.max_result_window": 20000
+index.query.default_field	设置默认搜索字段，避免每次查询都指定字段。	"index.query.default_field": ["title", "content"]
+3. 🔹 自定义分析器配置（核心能力）
+在 settings 中定义自定义分词器、字符过滤器、令牌过滤器，然后在 mapping 的字段中引用，这是处理复杂文本（如中文）的关键。
+示例：配置中文 IK 分词器（需提前安装 ik 插件）
+json
+"settings": {
+  "analysis": {
+    "analyzer": {
+      // 自定义一个中文分词器
+      "my_ik_analyzer": {
+        "type": "custom",
+        "tokenizer": "ik_max_word", // 细粒度分词（索引时用）
+        "filter": ["lowercase", "stop"] // 转小写 + 停用词过滤
+      },
+      "my_ik_search_analyzer": {
+        "type": "custom",
+        "tokenizer": "ik_smart", // 粗粒度分词（搜索时用）
+        "filter": ["lowercase"]
+      }
+    }
+  }
+}
+之后在 mapping 中引用：
+json
+"mapping": {
+  "properties": {
+    "content": {
+      "type": "text",
+      "analyzer": "my_ik_analyzer",
+      "search_analyzer": "my_ik_search_analyzer"
+    }
+  }
+}
+4. 🔹 分片分配与集群稳定性
+这类配置控制分片在集群节点上的分配策略，避免节点负载不均或磁盘耗尽。
+属性	作用	示例
+index.routing.allocation.disk.watermark.low	当节点磁盘使用率超过此阈值（默认 85%），不再分配新分片到该节点。	"index.routing.allocation.disk.watermark.low": "80%"
+index.routing.allocation.disk.watermark.high	当节点磁盘使用率超过此阈值（默认 90%），会将该节点的分片迁移到其他节点。	"index.routing.allocation.disk.watermark.high": "90%"
+index.routing.allocation.total_shards_per_node	限制单个节点上该索引的分片总数，避免单节点负载过高。	"index.routing.allocation.total_shards_per_node": 2
+
+
+🎯 三、settings vs mapping 核心区别
+维度	settings	mapping
+作用范围	索引级（全局）	字段级（局部）
+核心职责	控制索引的物理结构、性能策略、自定义分析器	控制单个字段的存储、索引、检索行为
+可修改性	部分动态可调，核心配置不可改	大部分字段属性不可改，仅支持新增字段
+典型场景	配置分片数、副本数、刷新间隔、自定义分词器	定义字段类型、是否索引、分词器引用、多字段
+📌 完整示例：创建索引时同时配置 settings + mapping
+json
+PUT /products
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 2,
+    "refresh_interval": "30s",
+    "analysis": {
+      "analyzer": {
+        "my_ik_analyzer": {
+          "type": "custom",
+          "tokenizer": "ik_max_word",
+          "filter": ["lowercase"]
+        }
+      }
+    }
+  },
+  "mapping": {
+    "properties": {
+      "title": {
+        "type": "text",
+        "analyzer": "my_ik_analyzer",
+        "fields": {
+          "keyword": { "type": "keyword", "ignore_above": 256 }
+        }
+      },
+      "price": { "type": "double" },
+      "create_time": { "type": "date", "format": "yyyy-MM-dd HH:mm:ss" }
+    }
+  }
+}

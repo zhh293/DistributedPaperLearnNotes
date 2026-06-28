@@ -1,0 +1,25 @@
+syntax = "proto3";
+//指定生成的代码是一个文件还是多个文件
+option java_multiple_files = false;
+//指定protobuf生成的类，放置到哪个包中
+option java_package = "com.example.helloworld";
+//指定生成的java代码外部类名（管理内部类用的）
+option java_outer_classname = "HelloWorldProto";
+
+//逻辑包
+//package helloworld;
+
+//导入
+//import "google/protobuf/empty.proto";
+
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+}
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+}

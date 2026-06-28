@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ES高亮搜索演示</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        
+        .search-form {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            align-items: center;
+        }
+        
+        .search-form input, .search-form select {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        
+        .search-form input {
+            flex-grow: 1;
+        }
+        
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        .results-container {
+            margin-top: 20px;
+        }
+        
+        .result-item {
+            border: 1px solid #eee;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            background-color: #fafafa;
+        }
+        
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .result-name {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .result-score {
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .result-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+        }
+        
+        .detail-item {
+            margin-bottom: 5px;
+        }
+        
+        .highlight {
+            background-color: yellow;
+            font-weight: bold;
+            padding: 2px 4px;
+            border-radius: 2px;
+        }
+        
+        .pagination {
+            display: flex;
+            justify-content: center;
+            margin-top: 20px;
+            gap: 10px;
+        }
+        
+        .page-btn {
+            padding: 8px 12px;
+            background-color: #6c757d;
+        }
+        
+        .page-btn.active {
+            background-color: #007bff;
+            color: white;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+        
+        .error {
+            color: red;
+            padding: 10px;
+            background-color: #ffe6e6;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ES高亮搜索演示</h1>
+        
+        <form class="search-form" id="searchForm">
+            <input type="text" id="searchKeyword" placeholder="输入搜索关键词..." required>
+            
+            <select id="searchType">
+                <option value="match">全文搜索</option>
+                <option value="term">精确搜索</option>
+                <option value="multi">多字段搜索</option>
+            </select>
+            
+            <select id="searchField">
+                <option value="name">姓名</option>
+                <option value="sex">性别</option>
+                <option value="tags">标签</option>
+            </select>
+            
+            <input type="text" id="highlightFields" placeholder="高亮字段(逗号分隔)" value="name,sex,tags">
+            
+            <button type="submit">搜索</button>
+        </form>
+        
+        <div id="errorMessage" class="error" style="display: none;"></div>
+        
+        <div id="loadingIndicator" class="loading" style="display: none;">
+            搜索中...
+        </div>
+        
+        <div id="resultsContainer" class="results-container"></div>
+        
+        <div id="paginationContainer" class="pagination" style="display: none;"></div>
+    </div>
+
+    <script>
+        document.getElementById('searchForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const keyword = document.getElementById('searchKeyword').value.trim();
+            const searchType = document.getElementById('searchType').value;
+            const searchField = document.getElementById('searchField').value;
+            const highlightFields = document.getElementById('highlightFields').value.trim();
+            
+            if (!keyword) {
+                showError('请输入搜索关键词');
+                return;
+            }
+            
+            showLoading(true);
+            hideError();
+            
+            try {
+                let url = '';
+                
+                switch (searchType) {
+                    case 'match':
+                        url = `/es/highlight/search/match/users/${searchField}/${encodeURIComponent(keyword)}?highlightFields=${encodeURIComponent(highlightFields)}`;
+                        break;
+                    case 'term':
+                        url = `/es/highlight/search/term/users/${searchField}/${encodeURIComponent(keyword)}?highlightFields=${encodeURIComponent(highlightFields)}`;
+                        break;
+                    case 'multi':
+                        url = `/es/highlight/search/multi/users/${encodeURIComponent(keyword)}?searchFields=${encodeURIComponent(searchField)}&highlightFields=${encodeURIComponent(highlightFields)}`;
+                        break;
+                }
+                
+                const response = await fetch(url);
+                
+                if (!response.ok) {
+                    throw new Error(`搜索失败: ${response.status} ${response.statusText}`);
+                }
+                
+                const results = await response.json();
+                displayResults(results);
+            } catch (error) {
+                console.error('搜索错误:', error);
+                showError(`搜索出错: ${error.message}`);
+            } finally {
+                showLoading(false);
+            }
+        });
+        
+        function displayResults(results) {
+            const container = document.getElementById('resultsContainer');
+            
+            if (results.length === 0) {
+                container.innerHTML = '<p>未找到匹配的结果</p>';
+                return;
+            }
+            
+            let html = '';
+            results.forEach(result => {
+                const user = result.user;
+                const highlights = result.highlights || {};
+                const score = result.score || 0;
+                
+                // 使用高亮内容，如果没有高亮则使用原始内容
+                const displayName = highlights.name ? highlights.name.join(' ... ') : user.name;
+                const displaySex = highlights.sex ? highlights.sex.join(' ... ') : user.sex;
+                const displayTags = highlights.tags ? highlights.tags.join(' ... ') : (user.tags ? user.tags.join(', ') : '');
+                
+                html += `
+                    <div class="result-item">
+                        <div class="result-header">
+                            <div class="result-name">${displayName}</div>
+                            <div class="result-score">相似度: ${(score * 100).toFixed(2)}%</div>
+                        </div>
+                        <div class="result-details">
+                            <div class="detail-item"><strong>姓名:</strong> ${displayName}</div>
+                            <div class="detail-item"><strong>年龄:</strong> ${user.age}</div>
+                            <div class="detail-item"><strong>性别:</strong> ${displaySex}</div>
+                            <div class="detail-item"><strong>标签:</strong> ${displayTags}</div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            container.innerHTML = html;
+        }
+        
+        function showError(message) {
+            const errorDiv = document.getElementById('errorMessage');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+        
+        function hideError() {
+            document.getElementById('errorMessage').style.display = 'none';
+        }
+        
+        function showLoading(show) {
+            const loadingDiv = document.getElementById('loadingIndicator');
+            loadingDiv.style.display = show ? 'block' : 'none';
+        }
+    </script>
+</body>
+</html>

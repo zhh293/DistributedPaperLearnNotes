@@ -1,0 +1,68 @@
+@startuml 日记系统-类图（实体+界面）
+left to right direction
+
+' 1. 核心数据实体类
+class User {
+  + userId: String  // 用户唯一标识
+  + userName: String  // 用户名
+}
+
+class DiaryTile {
+  + tileId: String  // 自动生成，唯一标识
+  + content: String  // 磁贴内容
+  + createTime: Date  // 创建时间
+  + updateTime: Date  // 更新时间
+}
+
+class PersonTile {
+  + tileId: String  // 唯一标识
+  + personName: String  // 人物姓名
+  + relatedEvent: String  // 相关事件
+  + moodScore: Integer  // 情绪分值（1-10）
+}
+
+class AIChatRecord {
+  + recordId: String  // 对话记录唯一标识
+  + chatContent: String  // 用户输入内容
+  + aiResponse: String  // AI响应内容
+  + chatTime: Date  // 对话时间
+}
+
+' 2. 界面功能类（封装操作逻辑）
+class DiaryTileUploadUI {
+  + createDiaryTile(): DiaryTile  // 创建日记磁贴，返回带ID的实例
+  + editDiaryTile(tile: DiaryTile): void  // 编辑日记磁贴
+  + deleteDiaryTile(tileId: String): void  // 删除日记磁贴
+  + viewDiaryTile(tileId: String): DiaryTile  // 查看磁贴信息
+}
+
+class PersonTileUI {
+  + addPersonTile(): PersonTile  // 添加人物磁贴
+  + associateWithDiary(personTile: PersonTile, diaryTile: DiaryTile): void  // 关联日记磁贴
+  + viewPersonTile(tileId: String): PersonTile  // 查看人物磁贴信息
+  + editPersonTile(tile: PersonTile): void  // 编辑人物磁贴
+  + deletePersonTile(tileId: String): void  // 删除人物磁贴
+}
+
+class AIChatUI {
+  + sendText(content: String): AIChatRecord  // 发送文本，生成对话记录
+  + viewStreamResponse(recordId: String): String  // 查看AI流式响应
+  + viewChatHistory(userId: String): List<AIChatRecord>  // 查看用户对话历史
+  + getAISuggestion(recordId: String): String  // 获取个性化建议/分析
+}
+
+' 3. 关系定义（聚合/依赖/关联）
+' 聚合关系：1个用户拥有多个磁贴/对话记录（空心菱形指向整体User）
+User "1" o-- "*" DiaryTile : 拥有（聚合）
+User "1" o-- "*" PersonTile : 拥有（聚合）
+User "1" o-- "*" AIChatRecord : 拥有（聚合）
+
+' 依赖关系：界面类操作数据实体（虚线箭头指向依赖的实体）
+DiaryTileUploadUI ..> DiaryTile : 依赖（操作日记磁贴）
+PersonTileUI ..> PersonTile : 依赖（操作人物磁贴）
+AIChatUI ..> AIChatRecord : 依赖（操作对话记录）
+
+' 关联关系：人物界面关联日记磁贴（实线箭头，标注关联逻辑）
+PersonTileUI --> DiaryTile : 关联到（人物-日记联动）
+
+@enduml

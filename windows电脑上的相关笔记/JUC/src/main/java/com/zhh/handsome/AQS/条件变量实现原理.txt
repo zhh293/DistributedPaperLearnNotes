@@ -1,0 +1,231 @@
+前置基础（源码层面）
+ReentrantLock 的条件变量通过newCondition()获取，底层是 AQS 的内部类ConditionObject（实现java.util.concurrent.locks.Condition接口）；
+条件变量必须在持有锁的前提下调用（await/signal/signalAll），否则会抛出IllegalMonitorStateException（和 Object 的 wait/notify 规则一致）；
+每个 Condition 对应一个独立的条件等待队列（区别于 AQS 的同步队列），队列节点复用 AQS 的Node类，节点状态用CONDITION(-2)标记（同步队列节点状态常用 SIGNAL (-1)/CANCELLED (1)）；
+条件变量的核心逻辑：await()释放锁并进入条件队列等待，signal()将条件队列的线程转移到同步队列等待抢锁。
+
+
+
+
+前置基础（源码层面）
+ReentrantLock 的条件变量通过newCondition()获取，底层是 AQS 的内部类ConditionObject（实现java.util.concurrent.locks.Condition接口）；
+条件变量必须在持有锁的前提下调用（await/signal/signalAll），否则会抛出IllegalMonitorStateException（和 Object 的 wait/notify 规则一致）；
+每个 Condition 对应一个独立的条件等待队列（区别于 AQS 的同步队列），队列节点复用 AQS 的Node类，节点状态用CONDITION(-2)标记（同步队列节点状态常用 SIGNAL (-1)/CANCELLED (1)）；
+条件变量的核心逻辑：await()释放锁并进入条件队列等待，signal()将条件队列的线程转移到同步队列等待抢锁。
+一、条件变量的创建（ReentrantLock.newCondition () 源码）
+先看条件变量的入口，理解它和 AQS 的关联：
+java
+运行
+// ReentrantLock.java 源码（JDK 8）
+public class ReentrantLock implements Lock, java.io.Serializable {
+    private final Sync sync; // 内部Sync继承AQS
+
+    // 暴露给用户的条件变量创建方法
+    public Condition newCondition() {
+        return sync.newCondition(); // 转发到Sync的newCondition
+    }
+
+    // 内部Sync类（继承AQS）
+    abstract static class Sync extends AbstractQueuedSynchronizer {
+        // 创建ConditionObject实例（AQS的内部类）
+        final ConditionObject newCondition() {
+            return new ConditionObject();
+        }
+    }
+}
+
+// AQS.java 源码（JDK 8）
+public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer {
+    // 条件变量的核心实现类（内部类）
+    public class ConditionObject implements Condition, java.io.Serializable {
+        // 条件等待队列的头节点（单向链表）
+        private transient Node firstWaiter;
+        // 条件等待队列的尾节点
+        private transient Node lastWaiter;
+
+        public ConditionObject() {} // 空构造，仅初始化队列指针
+    }
+}
+核心说明：
+ReentrantLock 的newCondition()本质是创建 AQS 的ConditionObject实例；
+条件等待队列是单向链表（通过Node.nextWaiter关联），区别于 AQS 同步队列的双向链表（Node.prev/next）。
+二、核心方法 1：await ()（释放锁 + 进入条件队列 + 等待唤醒）
+await()是条件变量的核心等待方法，调用后线程会释放锁、进入条件队列并 park，直到被 signal 唤醒或中断。源码如下（关键行加注释）：
+java
+运行
+// AQS.ConditionObject.await() 源码（JDK 8）
+public final void await() throws InterruptedException {
+    // 1. 前置检测：若线程已被中断，直接抛异常（await是可打断的）
+    if (Thread.interrupted())
+        throw new InterruptedException();
+
+    // 2. 创建CONDITION状态的节点，加入条件等待队列尾部
+    Node node = addConditionWaiter();
+
+    // 3. 释放当前线程持有的全部锁（ReentrantLock是重入锁，需释放所有重入次数）
+    int savedState = fullyRelease(node);
+    int interruptMode = 0; // 标记中断模式：0=无中断，THROW_IE=抛异常，REINTERRUPT=恢复中断
+
+    // 4. 循环检测：节点是否已转移到同步队列（未转移则park）
+    while (!isOnSyncQueue(node)) {
+        // 4.1 挂起线程，等待signal()唤醒 或 中断唤醒
+        LockSupport.park(this);
+
+        // 4.2 检测await期间是否被中断，返回中断模式
+        if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+            break; // 有中断则退出循环
+    }
+
+    // 5. 被唤醒后：进入同步队列抢锁（acquireQueued是不可打断抢锁逻辑）
+    if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+        interruptMode = REINTERRUPT;
+
+    // 6. 清理条件队列中的无效节点（CANCELLED状态）
+    if (node.nextWaiter != null)
+        unlinkCancelledWaiters();
+
+    // 7. 处理中断：根据中断模式抛异常 或 恢复中断标记
+    if (interruptMode != 0)
+        reportInterruptAfterWait(interruptMode);
+}
+关键子方法补充（真实源码片段）
+addConditionWaiter()：创建 CONDITION 节点并加入条件队列，清理无效节点
+java
+运行
+private Node addConditionWaiter() {
+    Node t = lastWaiter;
+    // 清理条件队列中已取消的节点（CANCELLED状态）
+    if (t != null && t.waitStatus != Node.CONDITION) {
+        unlinkCancelledWaiters();
+        t = lastWaiter;
+    }
+    // 创建CONDITION状态的独占节点
+    Node node = new Node(Thread.currentThread(), Node.CONDITION);
+    // 加入条件队列尾部
+    if (t == null)
+        firstWaiter = node;
+    else
+        t.nextWaiter = node;
+    lastWaiter = node;
+    return node;
+}
+fullyRelease(node)：释放锁的全部重入次数（ReentrantLock 重入特性）
+java
+运行
+final int fullyRelease(Node node) {
+    boolean failed = true;
+    try {
+        int savedState = getState(); // 获取当前锁的重入次数
+        // 释放全部重入次数（arg=savedState）
+        if (release(savedState)) {
+            failed = false;
+            return savedState;
+        } else {
+            throw new IllegalMonitorStateException(); // 未持有锁则抛异常
+        }
+    } finally {
+        if (failed)
+            node.waitStatus = Node.CANCELLED; // 释放失败则标记节点为取消
+    }
+}
+isOnSyncQueue(node)：判断节点是否从条件队列转移到同步队列（signal 后才会转移）
+java
+运行
+final boolean isOnSyncQueue(Node node) {
+    // 条件：1. 节点状态不是CONDITION（已转移） 2. prev不为null（同步队列是双向链表）
+    if (node.waitStatus == Node.CONDITION || node.prev == null)
+        return false;
+    if (node.next != null) // next不为null，说明在同步队列
+        return true;
+    // 兜底检测：遍历同步队列找该节点
+    return findNodeFromTail(node);
+}
+三、核心方法 2：signal ()（唤醒条件队列头节点，转移到同步队列）
+signal()会唤醒条件队列的头节点，将其从条件队列转移到 AQS 同步队列，等待抢锁。源码如下：
+java
+运行
+// AQS.ConditionObject.signal() 源码（JDK 8）
+public final void signal() {
+    // 1. 前置检测：当前线程必须持有锁（否则抛IllegalMonitorStateException）
+    if (!isHeldExclusively())
+        throw new IllegalMonitorStateException();
+
+    // 2. 获取条件队列的头节点
+    Node first = firstWaiter;
+    if (first != null)
+        doSignal(first); // 转移头节点到同步队列
+}
+
+// 核心：转移条件队列头节点到同步队列（只唤醒一个）
+private void doSignal(Node first) {
+    do {
+        // 移除条件队列的头节点
+        if ( (firstWaiter = first.nextWaiter) == null)
+            lastWaiter = null;
+        first.nextWaiter = null; // 断开条件队列的引用
+        // 转移节点到同步队列（transferForSignal返回false则尝试下一个节点）
+    } while (!transferForSignal(first) && (first = firstWaiter) != null);
+}
+
+// 转移节点到同步队列的核心逻辑
+final boolean transferForSignal(Node node) {
+    // 1. 将节点状态从CONDITION(-2)改为0（同步队列节点的初始状态）
+    if (!compareAndSetWaitStatus(node, Node.CONDITION, 0))
+        return false;
+
+    // 2. 将节点加入同步队列尾部（enq是AQS的入队方法）
+    Node p = enq(node);
+    int ws = p.waitStatus;
+
+    // 3. 若前驱节点是CANCELLED 或 CAS设置SIGNAL失败，直接unpark唤醒当前节点
+    if (ws > 0 || !compareAndSetWaitStatus(p, ws, Node.SIGNAL))
+        LockSupport.unpark(node.thread);
+
+    return true;
+}
+核心说明：
+signal()只能唤醒条件队列的头节点（公平唤醒）；
+转移节点时，会将节点状态从CONDITION(-2)改为0（同步队列节点的初始状态），并通过enq(node)加入同步队列；
+最后调用LockSupport.unpark()唤醒该节点的线程，线程会从await()的park()处恢复，继续执行抢锁逻辑。
+四、核心方法 3：signalAll ()（唤醒所有条件队列节点）
+signalAll()会唤醒条件队列的所有节点，逐个转移到同步队列。源码如下：
+java
+运行
+// AQS.ConditionObject.signalAll() 源码（JDK 8）
+public final void signalAll() {
+    // 前置检测：当前线程必须持有锁
+    if (!isHeldExclusively())
+        throw new IllegalMonitorStateException();
+
+    Node first = firstWaiter;
+    if (first != null)
+        doSignalAll(first); // 转移所有节点到同步队列
+}
+
+// 转移条件队列所有节点到同步队列
+private void doSignalAll(Node first) {
+    // 清空条件队列的指针
+    lastWaiter = firstWaiter = null;
+    // 遍历所有节点，逐个转移到同步队列
+    do {
+        Node next = first.nextWaiter;
+        first.nextWaiter = null;
+        transferForSignal(first); // 和signal()共用转移逻辑
+        first = next;
+    } while (first != null);
+}
+核心说明：
+signalAll()会清空条件队列，将所有节点转移到同步队列；
+转移逻辑和signal()一致（复用transferForSignal），区别是signal()只转移头节点，signalAll()转移全部。
+五、await () 和 signal () 的完整交互流程（源码视角）
+用流程图总结核心交互逻辑：
+A
+
+生成失败，请重试
+
+总结（核心源码要点）
+条件变量的载体：基于 AQS 的ConditionObject实现，每个 Condition 对应独立的单向条件等待队列（同步队列是双向链表）；
+await () 核心逻辑：持有锁→创建 CONDITION 节点入条件队列→释放全部锁→park 等待→被唤醒后入同步队列抢锁→重新持有锁；
+signal () 核心逻辑：持有锁→取条件队列头节点→转移到同步队列（改状态 + 入队）→unpark 唤醒线程；
+前置约束：await/signal/signalAll 必须在持有锁时调用，否则抛IllegalMonitorStateException；
+中断处理：await () 是可打断的，检测到中断会抛InterruptedException，并清理条件队列无效节点。

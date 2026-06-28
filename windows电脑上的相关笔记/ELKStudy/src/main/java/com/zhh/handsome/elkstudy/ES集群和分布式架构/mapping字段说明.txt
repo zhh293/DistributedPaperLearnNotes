@@ -1,0 +1,61 @@
+📋 一、基础核心属性
+这些是所有类型字段都可能用到的基础配置。
+属性	作用	可选值	场景示例
+type	定义字段的数据类型，决定 ES 如何存储和处理数据	text/keyword/date/integer/object/nested 等	"age": { "type": "integer" }
+index	控制字段是否被索引（即可否被搜索）	true（默认）/ false	图片 URL、流水号等无需搜索的字段：
+"image_url": { "type": "keyword", "index": false }
+store	控制字段是否独立存储（默认仅在 _source 中存储）	true/false（默认）	仅需单独获取字段而非整个 _source 时使用（很少用，推荐用 _source_includes 替代）
+doc_values	控制是否生成列存储结构（用于聚合、排序、脚本）	true（默认，除 text 外）/ false	不需要聚合排序的字段：
+"tags": { "type": "keyword", "doc_values": false }
+null_value	为 null 值指定替代值，让空值可被索引	任意与字段类型匹配的值	性别字段空值用 "unknown" 替代：
+"gender": { "type": "keyword", "null_value": "unknown" }
+copy_to	将多个字段的值复制到目标字段，实现联合搜索	目标字段名
+
+
+
+📝 二、文本（text）专属属性
+仅对 text 类型生效，用于控制分词和检索行为。
+属性	作用	可选值	场景示例
+analyzer	指定索引时的分词器，决定文本如何拆分为词条	standard（默认）/ ik_smart/ik_max_word/whitespace 等	中文内容用 ik 分词：
+"content": { "type": "text", "analyzer": "ik_max_word" }
+search_analyzer	指定搜索时的分词器，默认与 analyzer 一致	同 analyzer	索引细粒度、搜索粗粒度：
+"content": { "analyzer": "ik_max_word", "search_analyzer": "ik_smart" }
+fields	为一个字段创建多子字段，满足不同搜索 / 聚合需求	子字段配置	标题同时支持全文检索和精确聚合：
+json<br>"title": {<br> "type": "text",<br> "fields": {<br> "keyword": { "type": "keyword", "ignore_above": 256 }<br> }<br>}<br>
+boost	设置字段权重，提升该字段在相关性评分中的占比	浮点数（默认 1.0）	标题权重高于内容：
+"title": { "type": "text", "boost": 2.0 }
+fielddata	控制是否为 text 字段开启内存正排索引（用于聚合 / 排序）	true/false（默认）	不推荐长期使用，建议用 fields.keyword 替代
+
+
+
+📅 三、日期（date）专属属性
+属性	作用	可选值	场景示例
+format	指定日期的解析格式，支持多格式用 `		` 分隔	yyyy-MM-dd HH:mm:ss/epoch_millis/strict_date_optional_time（默认）等	同时支持字符串日期和时间戳：
+```json
+"create_time": {
+"type": "date",
+"format": "yyyy-MM-dd HH:mm:ss		epoch_millis"
+}
+```
+ignore_malformed	控制是否忽略格式错误的日期值	true/false（默认）	容忍非法日期格式，避免写入失败：
+"create_time": { "type": "date", "ignore_malformed": true }
+
+
+🔢 四、数值（number）专属属性
+属性	作用	可选值	场景示例
+ignore_malformed	控制是否忽略格式错误的数值（如字符串转数值失败）	true/false（默认）	容忍非法数值，避免写入失败：
+"price": { "type": "double", "ignore_malformed": true }
+coerce	控制是否自动转换数值类型（如 "123" → 123）	true（默认）/ false	严格校验数值类型，不允许转换：
+"age": { "type": "integer", "coerce": false }
+
+
+🧩 五、对象 / 嵌套（object/nested）专属属性
+属性	作用	可选值	场景示例
+properties	定义 object/nested 类型的子字段结构	子字段 mapping	嵌套用户信息：
+json<br>"user": {<br> "type": "object",<br> "properties": {<br> "name": { "type": "text" },<br> "age": { "type": "integer" }<br> }<br>}<br>
+type: "nested"	处理数组对象的关联查询，避免扁平化存储导致的错误匹配	nested	商品多规格（颜色 + 尺寸）的精确关联搜索：
+json<br>"specs": {<br> "type": "nested",<br> "properties": {<br> "color": { "type": "keyword" },<br> "size": { "type": "keyword" }<br> }<br>}<br>
+⚠️ 关键原则
+先规划后创建：mapping 一旦创建，大部分属性（如字段类型、主分片数）无法修改，只能新增字段或重建索引。
+按需设计：不需要搜索的字段设 index: false，不需要聚合的字段设 doc_values: false，减少资源浪费。
+类型匹配：日期用 date 而非 text，ID 用 keyword 而非 text，避免后续聚合 / 排序异常。

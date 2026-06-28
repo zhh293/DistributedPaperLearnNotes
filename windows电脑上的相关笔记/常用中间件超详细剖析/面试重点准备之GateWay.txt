@@ -1,0 +1,354 @@
+具体的流程分析：
+
+路由判断：客户端的请求到达网关后，先经过 Gateway Handler Mapping 处理，这里面会做断言（Predicate）判断，看下符合哪个路由规则，这个路由映射后端的某个服务。
+
+
+请求过滤：然后请求到达 Gateway Web Handler，这里面有很多过滤器，组成过滤器链（Filter Chain），这些过滤器可以对请求进行拦截和修改，比如添加请求头、参数校验等等，有点像净化污水。然后将请求转发到实际的后端服务。这些过滤器逻辑上可以称作 Pre-Filters，Pre 可以理解为“在...之前”。
+
+
+服务处理：后端服务会对请求进行处理。
+
+
+响应过滤：后端处理完结果后，返回给 Gateway 的过滤器再次做处理，逻辑上可以称作 Post-Filters，Post 可以理解为“在...之后”。
+
+
+响应返回：响应经过过滤处理后，返回给客户端。总结：客户端的请求先通过匹配规则找到合适的路由，就能映射到具体的服务。然后请求经过过滤器处理后转发给具体的服务，服务处理后，再次经过过滤器处理，最后返回给客户端
+
+
+
+Spring Cloud Gateway 的断言是什么？断言（Predicate）这个词听起来极其深奥，它是一种编程术语，我们生活中根本就不会用它。说白了它就是对一个表达式进行 if 判断，结果为真或假，如果为真则做这件事，否则做那件事。
+
+在 Gateway 中，如果客户端发送的请求满足了断言的条件，则映射到指定的路由器，就能转发到指定的服务上进行处理。
+
+断言配置的示例如下，配置了两个路由规则，有一个 predicates 断言配置，当请求 url 中包含 api/thirdparty，就匹配到了第一个路由 route_thirdparty。
+
+
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: route_thirdparty # 题目微服务路由规则
+          uri: lb://passjava-thirdparty # 负载均衡，将请求转发到注册中心注册的passjava-thirdparty服务
+          predicates: # 断言
+            - Path=/api/thirdparty/** # 如果前端请求路径包含 api/thirdparty，则应用这条路由规则
+          filters: # 过滤器
+            - RewritePath=/api/(?<segment>.*),/$\{segment} # 将跳转路径中包含的api替换成空
+
+        - id: route_question # 题目微服务路由规则
+          uri: lb://passjava-question # 负载均衡，将请求转发到注册中心注册的assjava-question服务
+          predicates: # 断言
+            - Path=/api/question/** # 如果前端请求路径包含 api/question，则应用这条路由规则
+          filters: # 过滤器
+            - RewritePath=/api/(?<segment>.*),/$\{segment} # 将跳转路径中包含的 api 替换成空
+
+
+
+
+
+
+
+
+一、先定核心关系（一句话讲死）
+断言（Predicate）是路由（Route）的 “筛选条件”，路由是 “满足条件后的执行动作”→ 只有断言判断为 true，这条路由规则才会生效；断言为 false，则跳过这条路由。
+通俗比喻：
+网关 = 小区大门
+路由（Route）= 小区的 “通行规则”（比如：去 1 号楼的人走北门、去 2 号楼的人走南门）
+断言（Predicate）= 门卫判断 “你该走哪条路” 的依据（比如：看你要去的地址、你拿的证件、你进门的时间）
+二、拆解完整规则（配配置示例，一看就会）
+1. 路由（Route）的核心构成
+每个路由是一个完整的 “条件 + 动作” 组合，核心包含 3 部分：
+yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: 路由唯一标识  # 比如 route_question
+          uri: 目标服务地址  # 比如 lb://passjava-question（要转发到的微服务）
+          predicates:       # 断言集合（多个断言，需全部满足才生效）
+            - 断言规则1
+            - 断言规则2
+          filters:          # 过滤器（可选，比如路径重写）
+            - 过滤规则
+
+
+2. 断言（Predicate）的核心规则
+规则 1：多个断言是 “且” 关系（必须全部满足）
+一个路由可以配置多个断言，只有所有断言都返回 true，这条路由才会被触发。
+yaml
+# 示例：只有“路径匹配 + 请求方法是GET”，才转发到question服务
+- id: route_question
+  uri: lb://passjava-question
+  predicates:
+    - Path=/api/question/**       # 断言1：请求路径以/api/question开头
+    - Method=GET                  # 断言2：请求方法是GET
+  filters:
+    - RewritePath=/api/(?<segment>.*),/$\{segment}
+→ 只有同时满足「路径匹配」+「GET 请求」，才会走这条路由；POST 请求、路径不对，都不会触发。
+规则 2：断言是 “路由的前置判断”（先判断，后执行）
+网关处理请求的完整流程：
+
+graph TD
+A[客户端发请求] --> B[网关接收请求]
+B --> C[遍历所有路由规则]
+C --> D{判断当前路由的断言是否全部为true?}
+D -- 否 --> E[跳过这条路由，继续下一条]
+D -- 是 --> F[执行这条路由的过滤器（比如路径重写）]
+F --> G[转发请求到uri指定的目标服务]
+G --> H[返回响应给客户端]
+
+
+
+规则 3：断言的 “匹配顺序”= 路由的配置顺序
+网关会从上到下遍历路由列表，只要匹配到第一条 “断言全部为 true” 的路由，就立即执行这条路由的逻辑，不会再匹配后续路由。
+yaml
+# 示例：配置顺序决定匹配优先级
+routes:
+  # 路由1：优先级高（先匹配）
+  - id: route_question_detail
+    uri: lb://passjava-question
+    predicates:
+      - Path=/api/question/detail/**  # 精准匹配详情路径
+  # 路由2：优先级低（后匹配）
+  - id: route_question
+    uri: lb://passjava-question
+    predicates:
+      - Path=/api/question/**         # 模糊匹配所有question路径
+→ 请求 http://网关/api/question/detail/1 会先匹配「路由 1」，不会走到「路由 2」。
+
+
+
+规则 4：断言的常见类型（落地必备）
+
+断言类型	作用	配置示例	场景
+Path	匹配请求路径（最常用）	Path=/api/question/**	按业务模块转发
+Method	匹配 HTTP 请求方法	Method=GET,POST	限制请求方式
+Query	匹配请求参数	Query=id,\d+	只转发带数字 id 参数的请求
+Header	匹配请求头	Header=token,.*	验证 token 是否存在
+After/Before	匹配请求时间	After=2026-03-06T12:00:00	限时开放接口
+RemoteAddr	匹配客户端 IP	RemoteAddr=192.168.1.0/24	限制 IP 访问
+
+
+结合你之前的配置，讲透实际应用
+你之前的配置：
+yaml
+- id: route_question
+  uri: lb://passjava-question
+  predicates:
+    - Path=/api/question/** # 断言：路径以/api/question开头
+  filters:
+    - RewritePath=/api/(?<segment>.*),/$\{segment}
+完整执行逻辑：
+客户端发请求：http://网关/api/question/list
+网关遍历路由，匹配到route_question的断言Path=/api/question/** → 返回true
+执行过滤器：把路径/api/question/list重写成/question/list
+转发请求到lb://passjava-question（负载均衡到 question 微服务）
+微服务处理/question/list请求，返回结果给网关，再返回给客户端
+如果客户端发的是http://网关/api/thirdparty/upload：→ 匹配不到route_question的断言（路径不对），会继续遍历下一条路由route_thirdparty，直到匹配成功。
+总结
+核心关系：断言是路由的 “筛选条件”，路由是 “满足条件的执行动作”；
+匹配规则：多个断言需全部满足、路由按配置顺序匹配（匹配到即停止）；
+核心场景：最常用Path断言按路径转发，可结合Method/Header等做更精准的筛选；
+关键提醒：配置路由时，精准路径的路由要放在模糊路径前面，避免被覆盖。
+
+
+
+
+
+
+
+
+Spring Cloud Gateway 如何实现动态路由？
+
+
+
+实现动态路由的方式有很多种，其中一种推荐的方式是基于 Nacos 注册中心来做。 Spring Cloud Gateway 可以从注册中心获取服务的元数据（例如服务名称、路径等），然后根据这些信息自动生成路由规则。这样，当你添加、移除或更新服务实例时，网关会自动感知并相应地调整路由规则，无需手动维护路由配置。
+
+
+
+
+
+Spring Cloud Gateway 的过滤器有哪些？
+
+
+过滤器 Filter 按照请求和响应可以分为两种：
+
+Pre 类型：在请求被转发到微服务之前，对请求进行拦截和修改，例如参数校验、权限校验、流量监控、日志输出以及协议转换等操作。
+
+Post 类型：微服务处理完请求后，返回响应给网关，网关可以再次进行处理，例如修改响应内容或响应头、日志输出、流量监控等。
+
+
+另外一种分类是按照过滤器 Filter 作用的范围进行划分：
+
+GatewayFilter：局部过滤器，应用在单个路由或一组路由上的过滤器。标红色表示比较常用的过滤器。
+
+GlobalFilter：全局过滤器，应用在所有路由上的过滤器。
+
+
+局部过滤器常见的局部过滤器如下图所示：
+
+
+图在文件夹中
+
+
+当然我们也可以自定义过滤器
+
+
+
+
+-- token_bucket.lua
+-- 入参：KEYS[1] = 令牌桶key，ARGV[1] = 桶最大容量，ARGV[2] = 每秒生成令牌数，ARGV[3] = 当前时间戳（毫秒）
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1]) -- 桶最大容量
+local rate = tonumber(ARGV[2])     -- 每秒生成令牌数
+local now = tonumber(ARGV[3])      -- 当前时间戳
+local token = 1                    -- 每次请求拿1个令牌
+
+-- Redis中存储的令牌桶数据：{最后更新时间, 当前令牌数}
+local bucket = redis.call('HMGET', key, 'last_time', 'token_num')
+local last_time = tonumber(bucket[1]) or now -- 首次访问，最后更新时间=当前时间
+local token_num = tonumber(bucket[2]) or capacity -- 首次访问，令牌数=桶容量
+
+-- 计算从上次更新到现在，生成的新令牌数
+local interval = now - last_time
+local new_token = math.floor(interval / 1000 * rate) -- 按秒生成令牌
+token_num = math.min(token_num + new_token, capacity) -- 令牌数不超过桶容量
+
+local result = 0
+if token_num >= token then
+    -- 有令牌，拿走1个
+    token_num = token_num - token
+    result = 1 -- 1=允许访问
+end
+
+-- 更新Redis中的令牌桶数据
+redis.call('HMSET', key, 'last_time', now, 'token_num', token_num)
+-- 设置过期时间（避免无用key占用内存）
+redis.call('EXPIRE', key, 3600)
+
+return result -- 返回1=放行，0=限流
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// TokenBucketRateLimitFilter.java
+@Component
+public class TokenBucketRateLimitFilter implements GatewayFilter, Ordered {
+
+    // Redis模板（响应式，适配Gateway非阻塞）
+    private final ReactiveRedisTemplate<String, String> redisTemplate;
+    // Lua脚本
+    private final DefaultRedisScript<Long> tokenBucketScript;
+
+    // 构造器注入
+    public TokenBucketRateLimitFilter(ReactiveRedisTemplate<String, String> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+        this.tokenBucketScript = new DefaultRedisScript<>();
+        tokenBucketScript.setScriptSource(new ResourceScriptSource(new ClassPathResource("lua/token_bucket.lua")));
+        tokenBucketScript.setResultType(Long.class); // Lua返回1/0，对应Long类型
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // 1. 令牌桶配置（可抽成配置文件，这里硬编码演示）
+        String bucketKey = "rate_limit:question"; // 针对question服务的令牌桶key
+        int capacity = 100; // 桶最大容量（最多存100个令牌）
+        int rate = 10; // 每秒生成10个令牌
+
+        // 2. 执行Lua脚本
+        List<String> keys = Collections.singletonList(bucketKey);
+        List<String> args = Arrays.asList(
+                String.valueOf(capacity),
+                String.valueOf(rate),
+                String.valueOf(System.currentTimeMillis())
+        );
+
+        return redisTemplate.execute(tokenBucketScript, keys, args)
+                .flatMap(result -> {
+                    if (result == 1) {
+                        // 3. 拿到令牌，继续执行过滤器链（后续执行路径重写）
+                        return chain.filter(exchange);
+                    } else {
+                        // 4. 没拿到令牌，返回429限流响应
+                        ServerHttpResponse response = exchange.getResponse();
+                        response.setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+                        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                        String errorMsg = "{\"code\":429,\"msg\":\"请求太频繁，请稍后再试\"}";
+                        DataBuffer buffer = response.bufferFactory().wrap(errorMsg.getBytes(StandardCharsets.UTF_8));
+                        return response.writeWith(Mono.just(buffer));
+                    }
+                });
+    }
+
+    // 过滤器执行顺序：数字越小，越先执行（要比路径重写过滤器先执行）
+    @Override
+    public int getOrder() {
+        return -1; // RewritePath的默认顺序是0，所以这里设为-1，先限流再重写路径
+    }
+}
+
+
+
+
+
+常见全局过滤器如图
+
+图也在文件夹
+
+全局过滤器最常见的用法是进行负载均衡
+
+
+
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: route_member # 第三方微服务路由规则
+          uri: lb://passjava-member # 负载均衡，将请求转发到注册中心注册的 passjava-member 服务
+          predicates: # 断言
+            - Path=/api/member/** # 如果前端请求路径包含 api/member，则应用这条路由规则
+          filters: #过滤器
+            - RewritePath=/api/(?<segment>.*),/$\{segment} # 将跳转路径中包含的api替换成空
+
+这里有个关键字 lb，用到了全局过滤器 LoadBalancerClientFilter，当匹配到这个路由后，会将请求转发到 passjava-member 服务，且支持负载均衡转发，也就是先将 passjava-member 解析成实际的微服务的 host 和 port，然后再转发给实际的微服务
+
+
+Spring Cloud Gateway 支持限流吗？
+
+
+Spring Cloud Gateway 自带了限流过滤器，对应的接口是 RateLimiter，RateLimiter 接口只有一个实现类 RedisRateLimiter （基于 Redis + Lua 实现的限流），提供的限流功能比较简易且不易使用。从 Sentinel 1.6.0 版本开始，Sentinel 引入了 Spring Cloud Gateway 的适配模块，可以提供两种资源维度的限流：route 维度和自定义 API 维度。也就是说，Spring Cloud Gateway 可以结合 Sentinel 实现更强大的网关流量控制
+
+
+
+在 SpringBoot 项目中，我们捕获全局异常只需要在项目中配置 @RestControllerAdvice和 @ExceptionHandler就可以了。不过，这种方式在 Spring Cloud Gateway 下不适用。Spring Cloud Gateway 提供了多种全局处理的方式，比较常用的一种是实现ErrorWebExceptionHandler并重写其中的handle方法。@Order(-1)
+@Component
+@RequiredArgsConstructor
+public class GlobalErrorWebExceptionHandler implements ErrorWebExceptionHandler {
+    private final ObjectMapper objectMapper;
+
+    @Override
+    public Mono<Void> handle(ServerWebExchange exchange, Throwable ex) {
+    // ...
+    }
+}
+
+
+
+
+
+
+
+
+
+
