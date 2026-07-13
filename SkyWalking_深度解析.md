@@ -4905,3 +4905,329 @@ sw8 协议只传递 8 个字段（不到 200 字节），足以还原完整调�
 **5. 采样决策前置**
 
 采样决策只在链路起点做一次，后续所有节点无条件跟随。这避免了"链路一半被采样、一半没被采样"导致的断链问题。通过 sw8 的第一个字段 "1"/"0" 传播采样结果。
+
+---
+
+## 十、源码级解析：Correlation Context 到底是怎么跨进程传递的
+
+> 前面章节提到 `sw8-correlation` 可以传递自定义 K-V 数据。但凭什么在上游 `CorrelationContext.put()` 之后，下游就能 `CorrelationContext.get()` 读到？中间到底发生了什么？本章结合 SkyWalking Agent 源码，把 Correlation Context 从写入到跨进程传播到下游读取的完整链路拆开给你看。
+
+### 10.1 先建立一个心智模型：三个阶段
+
+整个传播过程可以拆为三个阶段，对应三个核心方法：
+
+```
+阶段一：上游服务发起调用时 → inject(carrier)    → 把 CorrelationContext 塞进 carrier
+阶段二：carrier 序列化      → sw8-correlation Header → 随 HTTP/RPC 请求发出去
+阶段三：下游服务收到请求时 → extract(carrier)   → 从 carrier 恢复 CorrelationContext
+```
+
+对应到拦截器层面：
+
+```
+上游的 ExitSpan 拦截器（如 HttpClientExecuteInterceptor）触发 inject
+      ↓ HTTP 请求携带 sw8 + sw8-correlation Header
+下游的 EntrySpan 拦截器（如 TomcatInvokeInterceptor）触发 extract
+```
+
+下面一步一步结合源码走。
+
+### 10.2 阶段一：上游 inject —— CorrelationContext 写入 carrier
+
+当服务 A 要调用服务 B 时，SkyWalking 插件（如 HttpClient 插件）在 `beforeMethod` 中做了什么：
+
+```java
+// HttpClientExecuteInterceptor.beforeMethod() 中的关键路径：
+ContextCarrier contextCarrier = new ContextCarrier();
+AbstractSpan exitSpan = ContextManager.createExitSpan(operationName, contextCarrier, remotePeer);
+
+// ContextManager.createExitSpan 内部调用链：
+//   1. context.createExitSpan(op, peer)  → 创建 ExitSpan 压栈
+//   2. context.inject(carrier)           → 【关键】把上下文注入 carrier
+```
+
+`TracingContext.inject(carrier)` 的源码（核心部分）：
+
+```java
+// 源码：TracingContext.java
+public void inject(ContextCarrier carrier) {
+    AbstractSpan span = activeSpan();  // 栈顶的 ExitSpan
+    ExitSpan exitSpan = (ExitSpan) span;
+    
+    // ① 写入追踪上下文（这些最终序列化为 sw8 Header）
+    carrier.setTraceId(segment.getRelatedGlobalTraceId());
+    carrier.setTraceSegmentId(segment.getTraceSegmentId());
+    carrier.setSpanId(exitSpan.getSpanId());
+    carrier.setParentService(Config.Agent.SERVICE_NAME);
+    carrier.setParentServiceInstance(Config.Agent.INSTANCE_NAME);
+    carrier.setParentEndpoint(first().getOperationName());
+    carrier.setAddressUsedAtClient(exitSpan.getPeer());
+    
+    // ② 写入 Correlation Context（这些最终序列化为 sw8-correlation Header）
+    carrier.getCorrelationContext().handle(this.correlationContext);
+    
+    // ③ 写入扩展字段
+    carrier.getExtensionContext().handle(this.extensionContext);
+}
+```
+
+**关键点：** `carrier.getCorrelationContext().handle(this.correlationContext)` 这一行就是把当前 TracingContext 中保存的所有自定义 K-V 数据（你之前通过 `CorrelationContext.put("gray.lane", "gray-canary")` 写入的）复制到 carrier 中。
+
+### 10.3 阶段二：carrier 序列化为 HTTP Header
+
+inject 完成后，插件把 carrier 序列化并写入 HTTP 请求：
+
+```java
+// 插件将 carrier 写入 HTTP Header
+CarrierItem next = contextCarrier.items();
+while (next.hasNext()) {
+    next = next.next();
+    httpRequest.setHeader(next.getHeadKey(), next.getHeadValue());
+}
+```
+
+`contextCarrier.items()` 返回一个链表迭代器，里面包含两个节点：
+
+```
+节点1: headKey = "sw8"
+        headValue = "1-{base64TraceId}-{base64SegmentId}-{spanId}-{base64Service}-..."
+        → 追踪上下文
+
+节点2: headKey = "sw8-correlation"
+        headValue = "gray.lane=gray-canary,gray.rule_id=rule-2001"
+        → Correlation Context（你的灰度标识在这里！）
+```
+
+所以实际发出的 HTTP 请求长这样：
+
+```http
+GET /api/order/create HTTP/1.1
+Host: order-service:8080
+sw8: 1-dHJhY2VJZA==-c2VnbWVudElk-1-Z2F0ZXdheQ==-aW5zdGFuY2U=-...
+sw8-correlation: gray.lane=gray-canary,gray.rule_id=rule-2001
+```
+
+**注意：** `sw8-correlation` 的序列化格式就是简单的 `key=value` 用逗号分隔。没有 Base64 编码（和 sw8 不同），直接可读。
+
+### 10.4 阶段三：下游 extract —— 从 carrier 恢复 CorrelationContext
+
+下游服务（如 OrderService）收到请求时，Tomcat 插件的拦截器执行：
+
+```java
+// TomcatInvokeInterceptor.beforeMethod()
+public void beforeMethod(EnhancedInstance objInst, Method method,
+                         Object[] allArguments, ...) {
+    
+    HttpServletRequest request = (HttpServletRequest) allArguments[0];
+    
+    // ===== 第一步：从 HTTP Header 反序列化 ContextCarrier =====
+    ContextCarrier contextCarrier = new ContextCarrier();
+    CarrierItem next = contextCarrier.items();
+    while (next.hasNext()) {
+        next = next.next();
+        String headerKey = next.getHeadKey();     // "sw8" 或 "sw8-correlation"
+        String headerValue = request.getHeader(headerKey);
+        next.setHeadValue(headerValue);
+        // 内部自动反序列化：
+        //   "sw8" → 解析出 traceId, segmentId, spanId, parentService 等
+        //   "sw8-correlation" → 解析出 gray.lane=gray-canary 等 K-V 对
+    }
+    
+    // ===== 第二步：创建 EntrySpan 并 extract =====
+    AbstractSpan span = ContextManager.createEntrySpan(operationName, contextCarrier);
+    // 内部调用 context.extract(carrier)
+}
+```
+
+`TracingContext.extract(carrier)` 的源码：
+
+```java
+// 源码：TracingContext.java
+public void extract(ContextCarrier carrier) {
+    // 1. 创建父 Segment 引用
+    TraceSegmentRef ref = new TraceSegmentRef(carrier);
+    this.segment.ref(ref);
+    
+    // 2. 继承上游的 traceId（保证全链路同一个 traceId）
+    this.segment.relatedGlobalTraceId(new PropagatedTraceId(carrier.getTraceId()));
+    
+    // 3.【关键】提取 Correlation Context
+    this.correlationContext.extract(carrier.getCorrelationContext());
+    //    ↑ 这一行把 carrier 中的 {gray.lane=gray-canary, gray.rule_id=rule-2001}
+    //      复制到当前 TracingContext 的 correlationContext 字段中
+    //      之后在这个线程内调用 CorrelationContext.get("gray.lane") 就能拿到值了！
+}
+```
+
+**到这一步，下游服务的 TracingContext 已经拥有了完整的 Correlation Context 数据。**
+
+### 10.5 为什么下游可以直接用 CorrelationContext.get() 读到
+
+`CorrelationContext.get()` 的实现本质是读取当前线程 ThreadLocal 中的 TracingContext 的 correlationContext 字段：
+
+```java
+// 简化的调用路径：
+CorrelationContext.get("gray.lane")
+  → ContextManager.getContext()          // 从 ThreadLocal 获取当前 TracingContext
+    → context.getCorrelationContext()    // 获取 correlationContext 字段
+      → correlationContext.get("gray.lane")  // 从内部 Map 中取值
+        → "gray-canary"                 // 就是上游 put 进去的那个值！
+```
+
+所以整个链路是这样的：
+
+```
+上游 CorrelationContext.put("gray.lane", "gray-canary")
+  → 值存入上游 TracingContext.correlationContext (Map)
+    → inject() 时复制到 ContextCarrier.correlationContext
+      → 序列化为 sw8-correlation Header 发出去
+        → 下游拦截器读取 sw8-correlation Header
+          → 反序列化到 ContextCarrier.correlationContext
+            → extract() 时复制到下游 TracingContext.correlationContext
+              → 下游 CorrelationContext.get("gray.lane") == "gray-canary"
+```
+
+### 10.6 跨线程场景：capture() + continued()
+
+如果下游服务内部有异步操作（线程池、CompletableFuture、@Async），Correlation Context 通过另一条路径传播：
+
+**主线程 capture() 快照：**
+
+```java
+// 源码：TracingContext.capture()
+public ContextSnapshot capture() {
+    ContextSnapshot snapshot = new ContextSnapshot(
+        segment.getTraceSegmentId(),     // 当前 segmentId
+        activeSpan().getSpanId(),        // 当前 spanId
+        getReadablePrimaryTraceId(),     // traceId
+        firstSpan().getOperationName(),  // 入口端点名
+        correlationContext               // ← Correlation Context 也在快照里！
+    );
+    return snapshot;
+}
+```
+
+**子线程 continued() 恢复：**
+
+```java
+// 源码：TracingContext.continued()
+public void continued(ContextSnapshot snapshot) {
+    if (snapshot.isValid()) {
+        TraceSegmentRef ref = new TraceSegmentRef(snapshot);
+        this.segment.ref(ref);
+        
+        // 继承主线程的 traceId
+        this.segment.relatedGlobalTraceId(snapshot.getTraceId());
+        
+        // 继承主线程的 Correlation Context
+        this.correlationContext.continued(snapshot.getCorrelationContext());
+        //    ↑ 子线程也能 CorrelationContext.get("gray.lane") 了！
+    }
+}
+```
+
+**跨进程 vs 跨线程的区别：**
+
+| | 跨进程 | 跨线程 |
+|--|--------|--------|
+| 传播载体 | ContextCarrier（序列化为 HTTP Header） | ContextSnapshot（JVM 内存直接传引用） |
+| 触发方法 | inject() → extract() | capture() → continued() |
+| 是否需要序列化 | 是（Base64 / 字符串） | 否（直接传对象引用） |
+| CorrelationContext 传播 | carrier.getCorrelationContext().handle() | snapshot.getCorrelationContext() |
+| 本质 | 完全一致：都是把 correlationContext 从一个 TracingContext 复制到另一个 |
+
+### 10.7 完整数据流图：从 put 到 get 的每一步
+
+```mermaid
+graph TD
+    subgraph 网关服务 - 线程A
+        A1["CorrelationContext.put('gray.lane', 'gray-canary')"]
+        A2["值存入 TracingContext.correlationContext (Map)"]
+        A3["HttpClient插件 beforeMethod → createExitSpan"]
+        A4["TracingContext.inject(carrier)"]
+        A5["carrier.getCorrelationContext().handle(this.correlationContext)"]
+        A6["carrier 序列化 → sw8-correlation: gray.lane=gray-canary"]
+        A7["HTTP请求发出，携带 sw8 + sw8-correlation Header"]
+    end
+
+    subgraph OrderService - 线程B
+        B1["Tomcat插件 beforeMethod → 读取 request.getHeader('sw8-correlation')"]
+        B2["carrier 反序列化 → carrier.correlationContext = {gray.lane: gray-canary}"]
+        B3["ContextManager.createEntrySpan(op, carrier)"]
+        B4["TracingContext.extract(carrier)"]
+        B5["this.correlationContext.extract(carrier.getCorrelationContext())"]
+        B6["值存入下游 TracingContext.correlationContext (Map)"]
+        B7["CorrelationContext.get('gray.lane') → 'gray-canary' ✓"]
+    end
+
+    subgraph OrderService - 异步线程C
+        C1["主线程 capture() → snapshot 包含 correlationContext"]
+        C2["子线程 continued(snapshot)"]
+        C3["this.correlationContext.continued(snapshot.getCorrelationContext())"]
+        C4["CorrelationContext.get('gray.lane') → 'gray-canary' ✓"]
+    end
+
+    A1 --> A2 --> A3 --> A4 --> A5 --> A6 --> A7
+    A7 -->|HTTP| B1
+    B1 --> B2 --> B3 --> B4 --> B5 --> B6 --> B7
+    B6 --> C1 --> C2 --> C3 --> C4
+```
+
+### 10.8 结合灰度场景的完整拦截器调用时序
+
+以 "网关 → OrderService → PaymentService" 三跳链路为例，标注每个拦截器中 CorrelationContext 的状态：
+
+```
+时间线  位置                拦截器方法                         CorrelationContext 状态
+─────────────────────────────────────────────────────────────────────────────────────────────
+T1     网关              GatewayGrayInterceptor.beforeMethod()
+                          → CorrelationContext.put("gray.lane","gray-canary")
+                          → span.tag("gray.lane","gray-canary")
+                          correlationContext = {gray.lane: gray-canary}           ← 初次写入
+
+T2     网关              HttpClientInterceptor.beforeMethod()
+                          → ContextManager.createExitSpan(op, carrier, peer)
+                            → TracingContext.inject(carrier)
+                              → carrier.correlationContext = {gray.lane: gray-canary}  ← 复制到carrier
+                          → request.setHeader("sw8-correlation", "gray.lane=gray-canary")
+
+T3     OrderService      TomcatInvokeInterceptor.beforeMethod()
+                          → request.getHeader("sw8-correlation") = "gray.lane=gray-canary"
+                          → carrier 反序列化
+                          → ContextManager.createEntrySpan(op, carrier)
+                            → TracingContext.extract(carrier)
+                              → this.correlationContext = {gray.lane: gray-canary}  ← 从carrier恢复
+
+T4     OrderService      DownstreamGrayInterceptor.beforeMethod()
+                          → CorrelationContext.get("gray.lane") = "gray-canary"  ← 直接读到！
+                          → span.tag("gray.lane", "gray-canary")
+
+T5     OrderService      HttpClientInterceptor.beforeMethod()  (调PaymentService)
+                          → ContextManager.createExitSpan(op, carrier2, peer)
+                            → TracingContext.inject(carrier2)
+                              → carrier2.correlationContext = {gray.lane: gray-canary}  ← 再次复制
+                          → request.setHeader("sw8-correlation", "gray.lane=gray-canary")
+
+T6     PaymentService    TomcatInvokeInterceptor.beforeMethod()
+                          → 同T3流程...extract → correlationContext恢复
+
+T7     PaymentService    DownstreamGrayInterceptor.beforeMethod()
+                          → CorrelationContext.get("gray.lane") = "gray-canary"  ← 第三跳也能读到！
+                          → span.tag("gray.lane", "gray-canary")
+```
+
+### 10.9 关键源码方法一览表
+
+| 方法 | 所在类 | 作用 | 对 CorrelationContext 的操作 |
+|------|--------|------|---------------------------|
+| `CorrelationContext.put(key, value)` | CorrelationContext | 用户 API：写入自定义数据 | 写入当前线程 TracingContext 的 Map |
+| `CorrelationContext.get(key)` | CorrelationContext | 用户 API：读取自定义数据 | 从当前线程 TracingContext 的 Map 中读 |
+| `TracingContext.inject(carrier)` | TracingContext | 上游发起调用时注入 | `carrier.getCorrelationContext().handle(this.correlationContext)` |
+| `TracingContext.extract(carrier)` | TracingContext | 下游收到请求时提取 | `this.correlationContext.extract(carrier.getCorrelationContext())` |
+| `TracingContext.capture()` | TracingContext | 主线程创建快照 | 把 correlationContext 放入 snapshot |
+| `TracingContext.continued(snapshot)` | TracingContext | 子线程恢复上下文 | `this.correlationContext.continued(snapshot.getCorrelationContext())` |
+| `carrier.items()` | ContextCarrier | 序列化/反序列化迭代器 | 包含 sw8-correlation 节点 |
+
+### 10.10 一句话总结
+
+**CorrelationContext 之所以能"自动"跨进程传播，不是魔法，而是因为 SkyWalking Agent 的每个 RPC 出口插件（HttpClient、Dubbo、gRPC 等）在 `beforeMethod` 中都会调用 `inject(carrier)` 把它塞进 carrier，然后每个入口插件（Tomcat、Spring MVC、Dubbo Provider 等）在 `beforeMethod` 中都会调用 `extract(carrier)` 把它还原回来。** 这两步是所有 SkyWalking 插件的标准模板代码，所以只要你用 `CorrelationContext.put()` 写入了数据，所有插件都会帮你自动搬运——你不需要在每个服务里重复写传播逻辑。
